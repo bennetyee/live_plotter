@@ -1,7 +1,7 @@
 use clap::Parser;
 use eframe::egui;
 use egui::Color32;
-use egui_plot::{Legend, Line, Plot, PlotPoints};
+use egui_plot::{Corner, Legend, Line, Plot, PlotPoints};
 use std::collections::VecDeque;
 use std::io::{self, BufRead};
 use std::sync::{Arc, Mutex};
@@ -9,9 +9,9 @@ use std::thread;
 use std::process;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Live multi-series time plotter with hover support")]
+#[command(author, version, about = "Live multi-series time-series plotter")]
 struct Args {
-    /// Maximum number of data points to display per line
+    /// Maximum number of data points to display in the sliding window per series
     #[arg(short, long, default_value_t = 1000)]
     max_points: usize,
 
@@ -19,7 +19,7 @@ struct Args {
     #[arg(long, num_args = 1..)]
     include_y: Vec<f64>,
 
-    /// Labels for the data series. The number of labels defines the expected column count.
+    /// Labels for the data series. Number of labels sets expected columns.
     #[arg(short, long, num_args = 1..)]
     labels: Option<Vec<String>>,
 
@@ -30,6 +30,10 @@ struct Args {
     /// The title displayed at the top of the graph
     #[arg(short, long, default_value = "Live Time-Series Feed")]
     title: String,
+
+    /// Legend position: LeftTop, RightTop, LeftBottom, RightBottom
+    #[arg(long, default_value = "LeftTop")]
+    legend_pos: String,
 }
 
 struct DataPoint {
@@ -43,34 +47,39 @@ struct LivePlotApp {
     labels: Vec<String>,
     colors: Vec<Color32>,
     title: String,
+    legend_corner: Corner,
 }
 
 impl LivePlotApp {
     fn new(args: Args, data: Arc<Mutex<VecDeque<DataPoint>>>) -> Self {
         let labels = args.labels.unwrap_or_else(|| vec!["Series 1".to_string()]);
         
-        // Expanded 20-color qualitative palette for high contrast
+        let legend_corner = match args.legend_pos.to_lowercase().as_str() {
+            "lefttop" => Corner::LeftTop,
+            "righttop" => Corner::RightTop,
+            "leftbottom" => Corner::LeftBottom,
+            "rightbottom" => Corner::RightBottom,
+            _ => {
+                eprintln!(
+                    "FATAL ERROR: Invalid --legend-pos '{}'.\nAccepted values: LeftTop, RightTop, LeftBottom, RightBottom",
+                    args.legend_pos
+                );
+                process::exit(1);
+            }
+        };
+
+        // Default palette for multi-series visualization
         let default_palette = vec![
-            Color32::from_rgb(255, 85, 85),   // Red
-            Color32::from_rgb(85, 255, 85),   // Green
-            Color32::from_rgb(85, 85, 255),   // Blue
-            Color32::from_rgb(255, 255, 85),  // Yellow
-            Color32::from_rgb(255, 85, 255),  // Magenta
-            Color32::from_rgb(85, 255, 255),  // Cyan
-            Color32::from_rgb(255, 170, 0),   // Orange
-            Color32::from_rgb(170, 0, 255),   // Purple
-            Color32::from_rgb(0, 255, 170),   // Teal
-            Color32::from_rgb(255, 0, 127),   // Rose
-            Color32::from_rgb(170, 255, 0),   // Lime
-            Color32::from_rgb(0, 170, 255),   // Azure
-            Color32::from_rgb(255, 215, 180), // Apricot
-            Color32::from_rgb(128, 128, 128), // Grey
-            Color32::from_rgb(170, 110, 40),  // Brown
-            Color32::from_rgb(0, 128, 128),   // Dark Teal
-            Color32::from_rgb(230, 190, 255), // Lavender
-            Color32::from_rgb(128, 0, 0),     // Maroon
-            Color32::from_rgb(170, 255, 195), // Mint
-            Color32::from_rgb(128, 128, 0),   // Olive
+            Color32::from_rgb(255, 85, 85), Color32::from_rgb(85, 255, 85),
+            Color32::from_rgb(85, 85, 255), Color32::from_rgb(255, 255, 85),
+            Color32::from_rgb(255, 85, 255), Color32::from_rgb(85, 255, 255),
+            Color32::from_rgb(255, 170, 0), Color32::from_rgb(170, 0, 255),
+            Color32::from_rgb(0, 255, 170), Color32::from_rgb(255, 0, 127),
+            Color32::from_rgb(170, 255, 0), Color32::from_rgb(0, 170, 255),
+            Color32::from_rgb(255, 215, 180), Color32::from_rgb(128, 128, 128),
+            Color32::from_rgb(170, 110, 40), Color32::from_rgb(0, 128, 128),
+            Color32::from_rgb(230, 190, 255), Color32::from_rgb(128, 0, 0),
+            Color32::from_rgb(170, 255, 195), Color32::from_rgb(128, 128, 0),
         ];
 
         let mut colors = Vec::new();
@@ -92,6 +101,7 @@ impl LivePlotApp {
             labels,
             colors,
             title: args.title,
+            legend_corner,
         }
     }
 }
@@ -103,7 +113,7 @@ impl eframe::App for LivePlotApp {
             
             ui.horizontal(|ui| {
                 ui.heading(&self.title);
-                ui.weak("| Hover line for details | Double-click to reset");
+                ui.weak("| Hover for info | Double-click to reset scale");
             });
 
             let num_series = self.labels.len();
@@ -111,7 +121,6 @@ impl eframe::App for LivePlotApp {
                 .view_aspect(ui.available_width() / ui.available_height().max(1.0))
                 .allow_zoom(true)
                 .allow_drag(true)
-                // Custom tooltip formatter: Shows "Label: Value (Seq: X)"
                 .label_formatter(|name, value| {
                     if name.is_empty() {
                         format!("Seq: {:.0}\nVal: {:.4}", value.x, value.y)
@@ -121,7 +130,7 @@ impl eframe::App for LivePlotApp {
                 });
 
             if num_series > 1 {
-                plot = plot.legend(Legend::default());
+                plot = plot.legend(Legend::default().position(self.legend_corner));
             }
 
             plot = self.include_y_values.iter().fold(plot, |p, &y| p.include_y(y));
@@ -147,6 +156,7 @@ impl eframe::App for LivePlotApp {
 
 fn main() {
     let args = Args::parse();
+    
     let expected_cols = args.labels.as_ref().map_or(1, |l| l.len());
     let data_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(args.max_points)));
     let data_buffer_stdin = Arc::clone(&data_buffer);
@@ -170,7 +180,7 @@ fn main() {
 
                 if values.len() != expected_cols {
                     eprintln!(
-                        "FATAL ERROR: Input schema mismatch at line {}.\nExpected {} values, found {}.",
+                        "FATAL ERROR: Input schema mismatch at line {}.\nExpected {} columns, found {}.",
                         line_num, expected_cols, values.len()
                     );
                     process::exit(1);
@@ -181,6 +191,7 @@ fn main() {
                     seq: sequence_counter,
                     values,
                 });
+                
                 sequence_counter += 1;
                 if buffer.len() > max_points {
                     buffer.pop_front();
@@ -194,7 +205,7 @@ fn main() {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 600.0])
-            .with_title("Live Multi-Plotter"),
+            .with_title("Real-Time Multi-Series Plotter"),
         ..Default::default()
     };
 
