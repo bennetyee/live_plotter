@@ -9,7 +9,7 @@ use std::thread;
 use std::process;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Live multi-series time plotter with strict validation")]
+#[command(author, version, about = "Live multi-series time plotter with hover support")]
 struct Args {
     /// Maximum number of data points to display per line
     #[arg(short, long, default_value_t = 1000)]
@@ -49,6 +49,7 @@ impl LivePlotApp {
     fn new(args: Args, data: Arc<Mutex<VecDeque<DataPoint>>>) -> Self {
         let labels = args.labels.unwrap_or_else(|| vec!["Series 1".to_string()]);
         
+        // Expanded 20-color qualitative palette for high contrast
         let default_palette = vec![
             Color32::from_rgb(255, 85, 85),   // Red
             Color32::from_rgb(85, 255, 85),   // Green
@@ -56,6 +57,20 @@ impl LivePlotApp {
             Color32::from_rgb(255, 255, 85),  // Yellow
             Color32::from_rgb(255, 85, 255),  // Magenta
             Color32::from_rgb(85, 255, 255),  // Cyan
+            Color32::from_rgb(255, 170, 0),   // Orange
+            Color32::from_rgb(170, 0, 255),   // Purple
+            Color32::from_rgb(0, 255, 170),   // Teal
+            Color32::from_rgb(255, 0, 127),   // Rose
+            Color32::from_rgb(170, 255, 0),   // Lime
+            Color32::from_rgb(0, 170, 255),   // Azure
+            Color32::from_rgb(255, 215, 180), // Apricot
+            Color32::from_rgb(128, 128, 128), // Grey
+            Color32::from_rgb(170, 110, 40),  // Brown
+            Color32::from_rgb(0, 128, 128),   // Dark Teal
+            Color32::from_rgb(230, 190, 255), // Lavender
+            Color32::from_rgb(128, 0, 0),     // Maroon
+            Color32::from_rgb(170, 255, 195), // Mint
+            Color32::from_rgb(128, 128, 0),   // Olive
         ];
 
         let mut colors = Vec::new();
@@ -88,14 +103,22 @@ impl eframe::App for LivePlotApp {
             
             ui.horizontal(|ui| {
                 ui.heading(&self.title);
-                ui.weak("| Double-click to reset scale");
+                ui.weak("| Hover line for details | Double-click to reset");
             });
 
             let num_series = self.labels.len();
             let mut plot = Plot::new("live_plot")
                 .view_aspect(ui.available_width() / ui.available_height().max(1.0))
                 .allow_zoom(true)
-                .allow_drag(true);
+                .allow_drag(true)
+                // Custom tooltip formatter: Shows "Label: Value (Seq: X)"
+                .label_formatter(|name, value| {
+                    if name.is_empty() {
+                        format!("Seq: {:.0}\nVal: {:.4}", value.x, value.y)
+                    } else {
+                        format!("Series: {}\nVal: {:.4}\nSeq: {:.0}", name, value.y, value.x)
+                    }
+                });
 
             if num_series > 1 {
                 plot = plot.legend(Legend::default());
@@ -124,10 +147,7 @@ impl eframe::App for LivePlotApp {
 
 fn main() {
     let args = Args::parse();
-    
-    // Determine expected columns: number of labels provided, or 1 if default
     let expected_cols = args.labels.as_ref().map_or(1, |l| l.len());
-    
     let data_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(args.max_points)));
     let data_buffer_stdin = Arc::clone(&data_buffer);
     let max_points = args.max_points;
@@ -148,11 +168,10 @@ fn main() {
                     .filter_map(|s| s.parse::<f64>().ok())
                     .collect();
 
-                // FATAL ERROR CHECK
                 if values.len() != expected_cols {
                     eprintln!(
-                        "FATAL ERROR: Input schema mismatch at line {}.\nExpected {} values, found {}.\nLine content: \"{}\"",
-                        line_num, expected_cols, values.len(), trimmed
+                        "FATAL ERROR: Input schema mismatch at line {}.\nExpected {} values, found {}.",
+                        line_num, expected_cols, values.len()
                     );
                     process::exit(1);
                 }
@@ -174,7 +193,7 @@ fn main() {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 500.0])
+            .with_inner_size([1100.0, 600.0])
             .with_title("Live Multi-Plotter"),
         ..Default::default()
     };
