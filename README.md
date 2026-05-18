@@ -25,7 +25,7 @@ which it belongs.
 
 ## Disclaimer
 
-The code in this repo is entirely vibe coded.
+The code in this repo is entirely vibe coded using http://aistudio.google.com/.
 
 ## Usage
 
