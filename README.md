@@ -21,7 +21,7 @@ Double clicking resets the view to show everything.  Hovering over a
 data point shows the data values and the name of the time-series to
 which it belongs.
 
-<a href="screenshot.png">
+<img src="screenshot.png">
 
 ## Disclaimer
 
