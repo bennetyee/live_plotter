@@ -1,15 +1,15 @@
 use clap::Parser;
 use eframe::egui;
 use egui::Color32;
-use egui_plot::{Corner, Legend, Line, Plot, PlotPoints, PlotBounds};
+use egui_plot::{Corner, Legend, Line, Plot, PlotBounds, PlotPoints};
 use std::collections::VecDeque;
 use std::io::{self, BufRead};
+use std::process;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::process;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Live multi-series plotter")]
+#[command(author, version, about = "Live Multi-Series Plotter")]
 struct Args {
     #[arg(short, long, default_value_t = 10000)]
     max_points: usize,
@@ -45,10 +45,11 @@ struct LivePlotApp {
     colors: Vec<Color32>,
     title: String,
     legend_corner: Corner,
-    
+
+    // Viewport State
     default_viewport_width: f64,
     max_buffer_size: usize,
-    zoom_factor: f64, 
+    zoom_factor: f64,
     scroll_offset: f64,
     auto_follow: bool,
 }
@@ -56,7 +57,6 @@ struct LivePlotApp {
 impl LivePlotApp {
     fn new(args: Args, data: Arc<Mutex<VecDeque<DataPoint>>>) -> Self {
         let labels = args.labels.unwrap_or_else(|| vec!["Series 1".to_string()]);
-        
         let legend_corner = match args.legend_pos.to_lowercase().as_str() {
             "lefttop" => Corner::LeftTop,
             "righttop" => Corner::RightTop,
@@ -68,27 +68,39 @@ impl LivePlotApp {
             }
         };
 
-        let default_palette = vec![
-            Color32::from_rgb(255, 85, 85), Color32::from_rgb(85, 255, 85),
-            Color32::from_rgb(85, 85, 255), Color32::from_rgb(255, 255, 85),
-            Color32::from_rgb(255, 85, 255), Color32::from_rgb(85, 255, 255),
-            Color32::from_rgb(255, 170, 0), Color32::from_rgb(170, 0, 255),
-            Color32::from_rgb(0, 255, 170), Color32::from_rgb(255, 0, 127),
-            Color32::from_rgb(170, 255, 0), Color32::from_rgb(0, 170, 255),
-            Color32::from_rgb(255, 215, 180), Color32::from_rgb(128, 128, 128),
-            Color32::from_rgb(170, 110, 40), Color32::from_rgb(0, 128, 128),
-            Color32::from_rgb(230, 190, 255), Color32::from_rgb(128, 0, 0),
-            Color32::from_rgb(170, 255, 195), Color32::from_rgb(128, 128, 0),
+        let palette = vec![
+            Color32::from_rgb(255, 85, 85),
+            Color32::from_rgb(85, 255, 85),
+            Color32::from_rgb(85, 85, 255),
+            Color32::from_rgb(255, 255, 85),
+            Color32::from_rgb(255, 85, 255),
+            Color32::from_rgb(85, 255, 255),
+            Color32::from_rgb(255, 170, 0),
+            Color32::from_rgb(170, 0, 255),
+            Color32::from_rgb(0, 255, 170),
+            Color32::from_rgb(255, 0, 127),
+            Color32::from_rgb(170, 255, 0),
+            Color32::from_rgb(0, 170, 255),
+            Color32::from_rgb(255, 215, 180),
+            Color32::from_rgb(128, 128, 128),
+            Color32::from_rgb(170, 110, 40),
+            Color32::from_rgb(0, 128, 128),
+            Color32::from_rgb(230, 190, 255),
+            Color32::from_rgb(128, 0, 0),
+            Color32::from_rgb(170, 255, 195),
+            Color32::from_rgb(128, 128, 0),
         ];
 
         let mut colors = Vec::new();
         if let Some(hex_list) = args.colors {
             for hex in hex_list {
-                if let Ok(c) = Color32::from_hex(&hex) { colors.push(c); }
+                if let Ok(c) = Color32::from_hex(&hex) {
+                    colors.push(c);
+                }
             }
         }
         for i in colors.len()..labels.len() {
-            colors.push(default_palette[i % default_palette.len()]);
+            colors.push(palette[i % palette.len()]);
         }
 
         Self {
@@ -108,16 +120,16 @@ impl LivePlotApp {
 }
 
 impl eframe::App for LivePlotApp {
-    // In most eframe versions, this is still named 'update'
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
             let data_lock = self.data.lock().unwrap();
-            
-            let (first_seq, last_seq) = if let (Some(f), Some(l)) = (data_lock.front(), data_lock.back()) {
-                (f.seq as f64, l.seq as f64)
-            } else {
-                (0.0, 0.0)
-            };
+
+            let (first_seq, last_seq) =
+                if let (Some(f), Some(l)) = (data_lock.front(), data_lock.back()) {
+                    (f.seq as f64, l.seq as f64)
+                } else {
+                    (0.0, 0.0)
+                };
 
             // --- 1. HEADER CONTROLS ---
             ui.horizontal(|ui| {
@@ -127,22 +139,28 @@ impl eframe::App for LivePlotApp {
                 }
                 ui.separator();
                 ui.label("Zoom:");
-                
+
                 let min_zoom = self.default_viewport_width / self.max_buffer_size as f64;
                 let slider_width = (ui.available_width() - 110.0).max(50.0);
-                
-                ui.add_sized(
+
+                let zoom_slider = ui.add_sized(
                     [slider_width, ui.spacing().interact_size.y],
-                    egui::Slider::new(&mut self.zoom_factor, min_zoom..=10.0).show_value(false)
+                    egui::Slider::new(&mut self.zoom_factor, min_zoom..=20.0).show_value(false),
                 );
-                
+
+                if zoom_slider.changed() {
+                    self.auto_follow = false;
+                }
+
                 if ui.button("Reset View").clicked() {
                     self.zoom_factor = 1.0;
                     self.auto_follow = true;
                 }
             });
 
+            // Width of viewport based on slider
             let current_view_width = self.default_viewport_width / self.zoom_factor;
+
             if self.auto_follow {
                 self.scroll_offset = (last_seq - current_view_width).max(first_seq);
             }
@@ -150,28 +168,35 @@ impl eframe::App for LivePlotApp {
             // --- 2. THE PLOT ---
             let num_series = self.labels.len();
             let mut plot = Plot::new("live_plot")
-                .view_aspect(ui.available_width() / (ui.available_height() - 100.0).max(1.0))
-                // RESOLVE TYPE MISMATCH: Use [bool; 2].into() to satisfy the specific Vec2b version
-                .auto_bounds([false, false].into()) 
+                .view_aspect(ui.available_width() / (ui.available_height() - 90.0).max(1.0))
+                .auto_bounds([false, false].into())
                 .allow_zoom(true)
                 .allow_drag(true)
                 .label_formatter(|name, value| {
                     format!("Series: {}\nVal: {:.4}\nSeq: {:.0}", name, value.y, value.x)
                 });
 
+            // Ensure Y constraints
+            for &y in &self.include_y_values {
+                plot = plot.include_y(y);
+            }
+
             if num_series > 1 {
                 plot = plot.legend(Legend::default().position(self.legend_corner));
             }
 
             plot.show(ui, |plot_ui| {
-                let current_bounds = plot_ui.plot_bounds();
-                let drag_delta = plot_ui.pointer_coordinate_drag_delta();
+                // DETECTION: Pause LIVE mode if user interacts with mouse
+                // Fixed scroll_delta error by using raw_scroll_delta
+                let interaction = plot_ui.pointer_coordinate_drag_delta().length() > 0.0
+                    || plot_ui.ctx().input(|i| i.raw_scroll_delta.y).abs() > 0.0;
 
-                if drag_delta.x != 0.0 || drag_delta.y != 0.0 {
+                if interaction {
                     self.auto_follow = false;
                 }
 
-                let (y_min, y_max) = if self.auto_follow {
+                if self.auto_follow {
+                    // LIVE MODE: Snapping bounds to data end
                     let mut min_v = f64::INFINITY;
                     let mut max_v = f64::NEG_INFINITY;
                     for dp in data_lock.iter() {
@@ -186,29 +211,40 @@ impl eframe::App for LivePlotApp {
                         min_v = min_v.min(y);
                         max_v = max_v.max(y);
                     }
-                    if min_v.is_infinite() { (current_bounds.min()[1], current_bounds.max()[1]) }
-                    else {
+
+                    let y_range = if min_v.is_infinite() {
+                        (0.0, 1.0)
+                    } else {
                         let pad = (max_v - min_v).max(0.1) * 0.05;
                         (min_v - pad, max_v + pad)
-                    }
-                } else {
-                    (current_bounds.min()[1], current_bounds.max()[1])
-                };
+                    };
 
-                if !self.auto_follow && drag_delta.x != 0.0 {
-                    self.scroll_offset = current_bounds.min()[0];
+                    plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                        [self.scroll_offset, y_range.0],
+                        [self.scroll_offset + current_view_width, y_range.1],
+                    ));
+                } else {
+                    // INSPECT MODE: Read visual state back to sliders
+                    let bounds = plot_ui.plot_bounds();
+                    self.scroll_offset = bounds.min()[0];
+                    if bounds.width() > 0.0 {
+                        self.zoom_factor = self.default_viewport_width / bounds.width();
+                    }
+                    // IMPORTANT: We do NOT call set_plot_bounds here.
+                    // This lets egui_plot handle the camera movement without jitter.
                 }
 
-                plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                    [self.scroll_offset, y_min],
-                    [self.scroll_offset + current_view_width, y_max]
-                ));
-
+                // Render lines
                 for i in 0..num_series {
-                    let points: PlotPoints = data_lock.iter()
+                    let points: PlotPoints = data_lock
+                        .iter()
                         .map(|p| [p.seq as f64, p.values[i]])
                         .collect();
-                    plot_ui.line(Line::new(points).name(&self.labels[i]).color(self.colors[i]));
+                    plot_ui.line(
+                        Line::new(points)
+                            .name(&self.labels[i])
+                            .color(self.colors[i]),
+                    );
                 }
             });
 
@@ -216,18 +252,19 @@ impl eframe::App for LivePlotApp {
             ui.add_space(10.0);
             ui.label("History Scroll (Drag to far right for LIVE):");
             let scroll_max = (last_seq - current_view_width).max(first_seq);
-            
+
             let full_width = ui.available_width();
             let scroll_bar = ui.add_sized(
                 [full_width, ui.spacing().interact_size.y],
-                egui::Slider::new(&mut self.scroll_offset, first_seq..=scroll_max).show_value(false)
+                egui::Slider::new(&mut self.scroll_offset, first_seq..=scroll_max)
+                    .show_value(false),
             );
-            
+
             if scroll_bar.changed() {
-                self.auto_follow = self.scroll_offset >= (scroll_max - 0.001);
+                self.auto_follow = self.scroll_offset >= (scroll_max - 0.01);
             }
         });
-        
+
         ctx.request_repaint();
     }
 }
@@ -245,7 +282,9 @@ fn main() {
         for (line_idx, line) in stdin.lock().lines().enumerate() {
             if let Ok(line_str) = line {
                 let trimmed = line_str.trim();
-                if trimmed.is_empty() { continue; }
+                if trimmed.is_empty() {
+                    continue;
+                }
                 let values: Vec<f64> = trimmed
                     .split(|c: char| c == ',' || c.is_whitespace())
                     .filter(|s| !s.is_empty())
@@ -253,15 +292,27 @@ fn main() {
                     .collect();
 
                 if values.len() != expected_cols {
-                    eprintln!("FATAL ERROR: Line {} expected {} columns, found {}.", line_idx+1, expected_cols, values.len());
+                    eprintln!(
+                        "FATAL ERROR: Line {} expected {} columns, found {}.",
+                        line_idx + 1,
+                        expected_cols,
+                        values.len()
+                    );
                     process::exit(1);
                 }
 
                 let mut buffer = data_buffer_stdin.lock().unwrap();
-                buffer.push_back(DataPoint { seq: sequence_counter, values });
+                buffer.push_back(DataPoint {
+                    seq: sequence_counter,
+                    values,
+                });
                 sequence_counter += 1;
-                if buffer.len() > max_points { buffer.pop_front(); }
-            } else { break; }
+                if buffer.len() > max_points {
+                    buffer.pop_front();
+                }
+            } else {
+                break;
+            }
         }
     });
 
@@ -271,12 +322,16 @@ fn main() {
     };
 
     let result = eframe::run_native(
-        "Live Plotter", options,
+        "Live Plotter",
+        options,
         Box::new(|_cc| Ok(Box::new(LivePlotApp::new(args, data_buffer)))),
     );
 
     match result {
         Ok(_) => process::exit(0),
-        Err(e) => { eprintln!("GUI Error: {}", e); process::exit(1); }
+        Err(e) => {
+            eprintln!("GUI Error: {}", e);
+            process::exit(1);
+        }
     }
 }
