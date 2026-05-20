@@ -13,19 +13,27 @@ time-series data, and the number of labels must match the number of
 numbers per line of input.
 
 Unlike real strip charts, the display area is finite, and the
-`--max-points` command line argument specifies how many most-recent
-time values to retain per time-series data stream.  The GUI allows
-zooming into a smaller region, so it would be feasible to specify a
-huge number of sample times and just zoom into the most recent.
-Double clicking resets the view to show everything.  Hovering over a
-data point shows the data values and the name of the time-series to
-which it belongs.
+`--viewport-width` command line argument specifies how many
+most-recent time values to show in the default view.  The
+`--max-points` parameter specifies how many data points to retain per
+time-series data stream, and you can click-drag to scroll the viewport
+to see older data.  The GUI also allows zooming into a smaller region,
+so it would be feasible to specify a huge number of sample times and
+just zoom into the most recent.  After zooming, double clicking resets
+the view to show everything.  A `reset view` button resets the display
+to the default viewport-width wide view.  Hovering over a data point
+shows the data values and the name of the time-series to which it
+belongs.
 
 <img src="screenshot.png">
 
 ## Disclaimer
 
-The code in this repo is entirely vibe coded using http://aistudio.google.com/.
+The code in this repo is entirely vibe coded using
+http://aistudio.google.com/.  The only manual thing done other than
+cutting-and-pasting the AI Studio generated code into the repository
+is occasionally remembering to run `rustfmt`; the Studio generated
+code sometimes has extraneous trailing spaces and the like.
 
 ## Usage
 
