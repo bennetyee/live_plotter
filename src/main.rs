@@ -1,7 +1,7 @@
 use clap::Parser;
 use eframe::egui;
 use egui::Color32;
-use egui_plot::{Corner, Legend, Line, Plot, PlotPoints};
+use egui_plot::{Corner, Legend, Line, Plot, PlotPoints, PlotBounds};
 use std::collections::VecDeque;
 use std::io::{self, BufRead};
 use std::sync::{Arc, Mutex};
@@ -9,29 +9,26 @@ use std::thread;
 use std::process;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Live multi-series time-series plotter")]
+#[command(author, version, about = "Live multi-series plotter")]
 struct Args {
-    /// Maximum number of data points to display in the sliding window per series
-    #[arg(short, long, default_value_t = 1000)]
+    #[arg(short, long, default_value_t = 10000)]
     max_points: usize,
 
-    /// Y-axis values that should always be visible
+    #[arg(short, long, default_value_t = 500.0)]
+    viewport_width: f64,
+
     #[arg(long, num_args = 1..)]
     include_y: Vec<f64>,
 
-    /// Labels for the data series. Number of labels sets expected columns.
     #[arg(short, long, num_args = 1..)]
     labels: Option<Vec<String>>,
 
-    /// Hex colors for the lines (e.g., #ff0000 #00ff00).
     #[arg(short, long, num_args = 1..)]
     colors: Option<Vec<String>>,
 
-    /// The title displayed at the top of the graph
     #[arg(short, long, default_value = "Live Time-Series Feed")]
     title: String,
 
-    /// Legend position: LeftTop, RightTop, LeftBottom, RightBottom
     #[arg(long, default_value = "LeftTop")]
     legend_pos: String,
 }
@@ -48,6 +45,12 @@ struct LivePlotApp {
     colors: Vec<Color32>,
     title: String,
     legend_corner: Corner,
+    
+    default_viewport_width: f64,
+    max_buffer_size: usize,
+    zoom_factor: f64, 
+    scroll_offset: f64,
+    auto_follow: bool,
 }
 
 impl LivePlotApp {
@@ -60,15 +63,11 @@ impl LivePlotApp {
             "leftbottom" => Corner::LeftBottom,
             "rightbottom" => Corner::RightBottom,
             _ => {
-                eprintln!(
-                    "FATAL ERROR: Invalid --legend-pos '{}'.\nAccepted values: LeftTop, RightTop, LeftBottom, RightBottom",
-                    args.legend_pos
-                );
+                eprintln!("FATAL ERROR: Invalid --legend-pos '{}'.", args.legend_pos);
                 process::exit(1);
             }
         };
 
-        // Default palette for multi-series visualization
         let default_palette = vec![
             Color32::from_rgb(255, 85, 85), Color32::from_rgb(85, 255, 85),
             Color32::from_rgb(85, 85, 255), Color32::from_rgb(255, 255, 85),
@@ -85,12 +84,9 @@ impl LivePlotApp {
         let mut colors = Vec::new();
         if let Some(hex_list) = args.colors {
             for hex in hex_list {
-                if let Ok(c) = Color32::from_hex(&hex) {
-                    colors.push(c);
-                }
+                if let Ok(c) = Color32::from_hex(&hex) { colors.push(c); }
             }
         }
-        
         for i in colors.len()..labels.len() {
             colors.push(default_palette[i % default_palette.len()]);
         }
@@ -102,61 +98,142 @@ impl LivePlotApp {
             colors,
             title: args.title,
             legend_corner,
+            default_viewport_width: args.viewport_width,
+            max_buffer_size: args.max_points,
+            zoom_factor: 1.0,
+            scroll_offset: 0.0,
+            auto_follow: true,
         }
     }
 }
 
 impl eframe::App for LivePlotApp {
+    // In most eframe versions, this is still named 'update'
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
             let data_lock = self.data.lock().unwrap();
             
+            let (first_seq, last_seq) = if let (Some(f), Some(l)) = (data_lock.front(), data_lock.back()) {
+                (f.seq as f64, l.seq as f64)
+            } else {
+                (0.0, 0.0)
+            };
+
+            // --- 1. HEADER CONTROLS ---
             ui.horizontal(|ui| {
                 ui.heading(&self.title);
-                ui.weak("| Hover for info | Double-click to reset scale");
+                if self.auto_follow {
+                    ui.colored_label(Color32::from_rgb(100, 200, 255), "• LIVE");
+                }
+                ui.separator();
+                ui.label("Zoom:");
+                
+                let min_zoom = self.default_viewport_width / self.max_buffer_size as f64;
+                let slider_width = (ui.available_width() - 110.0).max(50.0);
+                
+                ui.add_sized(
+                    [slider_width, ui.spacing().interact_size.y],
+                    egui::Slider::new(&mut self.zoom_factor, min_zoom..=10.0).show_value(false)
+                );
+                
+                if ui.button("Reset View").clicked() {
+                    self.zoom_factor = 1.0;
+                    self.auto_follow = true;
+                }
             });
 
+            let current_view_width = self.default_viewport_width / self.zoom_factor;
+            if self.auto_follow {
+                self.scroll_offset = (last_seq - current_view_width).max(first_seq);
+            }
+
+            // --- 2. THE PLOT ---
             let num_series = self.labels.len();
             let mut plot = Plot::new("live_plot")
-                .view_aspect(ui.available_width() / ui.available_height().max(1.0))
+                .view_aspect(ui.available_width() / (ui.available_height() - 100.0).max(1.0))
+                // RESOLVE TYPE MISMATCH: Use [bool; 2].into() to satisfy the specific Vec2b version
+                .auto_bounds([false, false].into()) 
                 .allow_zoom(true)
                 .allow_drag(true)
                 .label_formatter(|name, value| {
-                    if name.is_empty() {
-                        format!("Seq: {:.0}\nVal: {:.4}", value.x, value.y)
-                    } else {
-                        format!("Series: {}\nVal: {:.4}\nSeq: {:.0}", name, value.y, value.x)
-                    }
+                    format!("Series: {}\nVal: {:.4}\nSeq: {:.0}", name, value.y, value.x)
                 });
 
             if num_series > 1 {
                 plot = plot.legend(Legend::default().position(self.legend_corner));
             }
 
-            plot = self.include_y_values.iter().fold(plot, |p, &y| p.include_y(y));
-
             plot.show(ui, |plot_ui| {
+                let current_bounds = plot_ui.plot_bounds();
+                let drag_delta = plot_ui.pointer_coordinate_drag_delta();
+
+                if drag_delta.x != 0.0 || drag_delta.y != 0.0 {
+                    self.auto_follow = false;
+                }
+
+                let (y_min, y_max) = if self.auto_follow {
+                    let mut min_v = f64::INFINITY;
+                    let mut max_v = f64::NEG_INFINITY;
+                    for dp in data_lock.iter() {
+                        if (dp.seq as f64) >= self.scroll_offset {
+                            for &v in &dp.values {
+                                min_v = min_v.min(v);
+                                max_v = max_v.max(v);
+                            }
+                        }
+                    }
+                    for &y in &self.include_y_values {
+                        min_v = min_v.min(y);
+                        max_v = max_v.max(y);
+                    }
+                    if min_v.is_infinite() { (current_bounds.min()[1], current_bounds.max()[1]) }
+                    else {
+                        let pad = (max_v - min_v).max(0.1) * 0.05;
+                        (min_v - pad, max_v + pad)
+                    }
+                } else {
+                    (current_bounds.min()[1], current_bounds.max()[1])
+                };
+
+                if !self.auto_follow && drag_delta.x != 0.0 {
+                    self.scroll_offset = current_bounds.min()[0];
+                }
+
+                plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                    [self.scroll_offset, y_min],
+                    [self.scroll_offset + current_view_width, y_max]
+                ));
+
                 for i in 0..num_series {
-                    let points: PlotPoints = data_lock
-                        .iter()
+                    let points: PlotPoints = data_lock.iter()
                         .map(|p| [p.seq as f64, p.values[i]])
                         .collect();
-
-                    let line = Line::new(points)
-                        .name(&self.labels[i])
-                        .color(self.colors[i]);
-                    
-                    plot_ui.line(line);
+                    plot_ui.line(Line::new(points).name(&self.labels[i]).color(self.colors[i]));
                 }
             });
+
+            // --- 3. FOOTER HISTORY SLIDER ---
+            ui.add_space(10.0);
+            ui.label("History Scroll (Drag to far right for LIVE):");
+            let scroll_max = (last_seq - current_view_width).max(first_seq);
+            
+            let full_width = ui.available_width();
+            let scroll_bar = ui.add_sized(
+                [full_width, ui.spacing().interact_size.y],
+                egui::Slider::new(&mut self.scroll_offset, first_seq..=scroll_max).show_value(false)
+            );
+            
+            if scroll_bar.changed() {
+                self.auto_follow = self.scroll_offset >= (scroll_max - 0.001);
+            }
         });
+        
         ctx.request_repaint();
     }
 }
 
 fn main() {
     let args = Args::parse();
-    
     let expected_cols = args.labels.as_ref().map_or(1, |l| l.len());
     let data_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(args.max_points)));
     let data_buffer_stdin = Arc::clone(&data_buffer);
@@ -165,13 +242,10 @@ fn main() {
     thread::spawn(move || {
         let stdin = io::stdin();
         let mut sequence_counter: u64 = 0;
-        
         for (line_idx, line) in stdin.lock().lines().enumerate() {
-            let line_num = line_idx + 1;
             if let Ok(line_str) = line {
                 let trimmed = line_str.trim();
                 if trimmed.is_empty() { continue; }
-
                 let values: Vec<f64> = trimmed
                     .split(|c: char| c == ',' || c.is_whitespace())
                     .filter(|s| !s.is_empty())
@@ -179,47 +253,30 @@ fn main() {
                     .collect();
 
                 if values.len() != expected_cols {
-                    eprintln!(
-                        "FATAL ERROR: Input schema mismatch at line {}.\nExpected {} columns, found {}.",
-                        line_num, expected_cols, values.len()
-                    );
+                    eprintln!("FATAL ERROR: Line {} expected {} columns, found {}.", line_idx+1, expected_cols, values.len());
                     process::exit(1);
                 }
 
                 let mut buffer = data_buffer_stdin.lock().unwrap();
-                buffer.push_back(DataPoint {
-                    seq: sequence_counter,
-                    values,
-                });
-                
+                buffer.push_back(DataPoint { seq: sequence_counter, values });
                 sequence_counter += 1;
-                if buffer.len() > max_points {
-                    buffer.pop_front();
-                }
-            } else {
-                break;
-            }
+                if buffer.len() > max_points { buffer.pop_front(); }
+            } else { break; }
         }
     });
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 600.0])
-            .with_title("Real-Time Multi-Series Plotter"),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 800.0]),
         ..Default::default()
     };
 
     let result = eframe::run_native(
-        "Live Plotter",
-        options,
-        Box::new(|_cc| Box::new(LivePlotApp::new(args, data_buffer))),
+        "Live Plotter", options,
+        Box::new(|_cc| Ok(Box::new(LivePlotApp::new(args, data_buffer)))),
     );
 
     match result {
         Ok(_) => process::exit(0),
-        Err(e) => {
-            eprintln!("GUI Error: {}", e);
-            process::exit(1);
-        }
+        Err(e) => { eprintln!("GUI Error: {}", e); process::exit(1); }
     }
 }
