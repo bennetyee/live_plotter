@@ -9,26 +9,33 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Live Multi-Series Plotter")]
+#[command(author, version, about = "Optimized Live Multi-Series Plotter")]
 struct Args {
+    /// Maximum number of data points to display in the total buffer per series
     #[arg(short, long, default_value_t = 10000)]
     max_points: usize,
 
+    /// Initial number of sequence points visible in the viewport
     #[arg(short, long, default_value_t = 500.0)]
     viewport_width: f64,
 
+    /// Y-axis values that should always be visible (baseline/ceiling)
     #[arg(long, num_args = 1..)]
     include_y: Vec<f64>,
 
+    /// Labels for the data series (Number of labels sets expected columns)
     #[arg(short, long, num_args = 1..)]
     labels: Option<Vec<String>>,
 
+    /// Hex colors for the lines (e.g., #ff0000 #00ff00)
     #[arg(short, long, num_args = 1..)]
     colors: Option<Vec<String>>,
 
+    /// The title displayed at the top of the graph
     #[arg(short, long, default_value = "Live Time-Series Feed")]
     title: String,
 
+    /// Legend position: LeftTop, RightTop, LeftBottom, RightBottom
     #[arg(long, default_value = "LeftTop")]
     legend_pos: String,
 }
@@ -131,7 +138,6 @@ impl eframe::App for LivePlotApp {
                     (0.0, 0.0)
                 };
 
-            // --- 1. HEADER CONTROLS ---
             ui.horizontal(|ui| {
                 ui.heading(&self.title);
                 if self.auto_follow {
@@ -158,17 +164,14 @@ impl eframe::App for LivePlotApp {
                 }
             });
 
-            // Width of viewport based on slider
             let current_view_width = self.default_viewport_width / self.zoom_factor;
-
             if self.auto_follow {
                 self.scroll_offset = (last_seq - current_view_width).max(first_seq);
             }
 
-            // --- 2. THE PLOT ---
             let num_series = self.labels.len();
             let mut plot = Plot::new("live_plot")
-                .view_aspect(ui.available_width() / (ui.available_height() - 90.0).max(1.0))
+                .view_aspect(ui.available_width() / (ui.available_height() - 95.0).max(1.0))
                 .auto_bounds([false, false].into())
                 .allow_zoom(true)
                 .allow_drag(true)
@@ -176,7 +179,6 @@ impl eframe::App for LivePlotApp {
                     format!("Series: {}\nVal: {:.4}\nSeq: {:.0}", name, value.y, value.x)
                 });
 
-            // Ensure Y constraints
             for &y in &self.include_y_values {
                 plot = plot.include_y(y);
             }
@@ -186,8 +188,9 @@ impl eframe::App for LivePlotApp {
             }
 
             plot.show(ui, |plot_ui| {
-                // DETECTION: Pause LIVE mode if user interacts with mouse
-                // Fixed scroll_delta error by using raw_scroll_delta
+                let bounds = plot_ui.plot_bounds();
+
+                // Detection: use raw_scroll_delta for newer egui compatibility
                 let interaction = plot_ui.pointer_coordinate_drag_delta().length() > 0.0
                     || plot_ui.ctx().input(|i| i.raw_scroll_delta.y).abs() > 0.0;
 
@@ -196,7 +199,6 @@ impl eframe::App for LivePlotApp {
                 }
 
                 if self.auto_follow {
-                    // LIVE MODE: Snapping bounds to data end
                     let mut min_v = f64::INFINITY;
                     let mut max_v = f64::NEG_INFINITY;
                     for dp in data_lock.iter() {
@@ -224,17 +226,14 @@ impl eframe::App for LivePlotApp {
                         [self.scroll_offset + current_view_width, y_range.1],
                     ));
                 } else {
-                    // INSPECT MODE: Read visual state back to sliders
-                    let bounds = plot_ui.plot_bounds();
+                    // Sync state from manual panning
                     self.scroll_offset = bounds.min()[0];
                     if bounds.width() > 0.0 {
                         self.zoom_factor = self.default_viewport_width / bounds.width();
                     }
-                    // IMPORTANT: We do NOT call set_plot_bounds here.
-                    // This lets egui_plot handle the camera movement without jitter.
                 }
 
-                // Render lines
+                // Render lines from all data in buffer
                 for i in 0..num_series {
                     let points: PlotPoints = data_lock
                         .iter()
@@ -248,7 +247,6 @@ impl eframe::App for LivePlotApp {
                 }
             });
 
-            // --- 3. FOOTER HISTORY SLIDER ---
             ui.add_space(10.0);
             ui.label("History Scroll (Drag to far right for LIVE):");
             let scroll_max = (last_seq - current_view_width).max(first_seq);
@@ -265,73 +263,73 @@ impl eframe::App for LivePlotApp {
             }
         });
 
-        ctx.request_repaint();
+        // Repaint is requested only when data arrives in the thread below
     }
 }
 
 fn main() {
     let args = Args::parse();
     let expected_cols = args.labels.as_ref().map_or(1, |l| l.len());
-    let data_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(args.max_points)));
-    let data_buffer_stdin = Arc::clone(&data_buffer);
     let max_points = args.max_points;
 
-    thread::spawn(move || {
-        let stdin = io::stdin();
-        let mut sequence_counter: u64 = 0;
-        for (line_idx, line) in stdin.lock().lines().enumerate() {
-            if let Ok(line_str) = line {
-                let trimmed = line_str.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let values: Vec<f64> = trimmed
-                    .split(|c: char| c == ',' || c.is_whitespace())
-                    .filter(|s| !s.is_empty())
-                    .filter_map(|s| s.parse::<f64>().ok())
-                    .collect();
-
-                if values.len() != expected_cols {
-                    eprintln!(
-                        "FATAL ERROR: Line {} expected {} columns, found {}.",
-                        line_idx + 1,
-                        expected_cols,
-                        values.len()
-                    );
-                    process::exit(1);
-                }
-
-                let mut buffer = data_buffer_stdin.lock().unwrap();
-                buffer.push_back(DataPoint {
-                    seq: sequence_counter,
-                    values,
-                });
-                sequence_counter += 1;
-                if buffer.len() > max_points {
-                    buffer.pop_front();
-                }
-            } else {
-                break;
-            }
-        }
-    });
+    let data_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(max_points)));
+    let data_buffer_stdin = Arc::clone(&data_buffer);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 800.0]),
         ..Default::default()
     };
 
-    let result = eframe::run_native(
+    eframe::run_native(
         "Live Plotter",
         options,
-        Box::new(|_cc| Ok(Box::new(LivePlotApp::new(args, data_buffer)))),
-    );
+        Box::new(move |cc| {
+            let ctx = cc.egui_ctx.clone();
+            thread::spawn(move || {
+                let stdin = io::stdin();
+                let mut sequence_counter: u64 = 0;
+                for line in stdin.lock().lines() {
+                    if let Ok(line_str) = line {
+                        let trimmed = line_str.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let values: Vec<f64> = trimmed
+                            .split(|c: char| c == ',' || c.is_whitespace())
+                            .filter(|s| !s.is_empty())
+                            .filter_map(|s| s.parse::<f64>().ok())
+                            .collect();
 
-    match result {
-        Ok(_) => process::exit(0),
-        Err(e) => {
-            eprintln!("GUI Error: {}", e);
-            process::exit(1);
-        }
-    }
+                        if values.len() != expected_cols {
+                            eprintln!(
+                                "FATAL ERROR: expected {} columns, found {}.",
+                                expected_cols,
+                                values.len()
+                            );
+                            process::exit(1);
+                        }
+
+                        {
+                            let mut buffer = data_buffer_stdin.lock().unwrap();
+                            buffer.push_back(DataPoint {
+                                seq: sequence_counter,
+                                values,
+                            });
+                            sequence_counter += 1;
+                            if buffer.len() > max_points {
+                                buffer.pop_front();
+                            }
+                        }
+
+                        // Only repaint when data actually arrives
+                        ctx.request_repaint();
+                    } else {
+                        break;
+                    }
+                }
+            });
+            Ok(Box::new(LivePlotApp::new(args, data_buffer)))
+        }),
+    )
+    .unwrap();
 }
