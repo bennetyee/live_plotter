@@ -1,3 +1,4 @@
+use chrono::{DateTime, Local, TimeZone};
 use clap::Parser;
 use eframe::egui;
 use egui::Color32;
@@ -8,22 +9,26 @@ use std::process;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-#[derive(Parser, Debug)]
-#[command(author, version, about = "Optimized Live Multi-Series Plotter")]
+#[derive(Parser, Debug, Clone)]
+#[command(author, version, about = "Live Multi-Series Plotter with Time Support")]
 struct Args {
     /// Maximum number of data points to display in the total buffer per series
     #[arg(short, long, default_value_t = 10000)]
     max_points: usize,
 
-    /// Initial number of sequence points visible in the viewport
+    /// Initial number of X-axis units visible in the viewport (seconds or sequence count)
     #[arg(short, long, default_value_t = 500.0)]
     viewport_width: f64,
 
-    /// Y-axis values that should always be visible (baseline/ceiling)
+    /// Interpret the first column as a Unix timestamp (seconds since epoch)
+    #[arg(short, long, default_value_t = false)]
+    time: bool,
+
+    /// Y-axis values that should always be visible
     #[arg(long, num_args = 1..)]
     include_y: Vec<f64>,
 
-    /// Labels for the data series (Number of labels sets expected columns)
+    /// Labels for the data series. The number of labels sets expected data columns.
     #[arg(short, long, num_args = 1..)]
     labels: Option<Vec<String>>,
 
@@ -41,7 +46,7 @@ struct Args {
 }
 
 struct DataPoint {
-    seq: u64,
+    x: f64, // Either sequence number or unix timestamp
     values: Vec<f64>,
 }
 
@@ -52,6 +57,7 @@ struct LivePlotApp {
     colors: Vec<Color32>,
     title: String,
     legend_corner: Corner,
+    is_time_mode: bool,
 
     // Viewport State
     default_viewport_width: f64,
@@ -117,11 +123,23 @@ impl LivePlotApp {
             colors,
             title: args.title,
             legend_corner,
+            is_time_mode: args.time,
             default_viewport_width: args.viewport_width,
             max_buffer_size: args.max_points,
             zoom_factor: 1.0,
             scroll_offset: 0.0,
             auto_follow: true,
+        }
+    }
+
+    fn format_x(&self, x: f64) -> String {
+        if self.is_time_mode {
+            let datetime: DateTime<Local> = Local
+                .timestamp_opt(x as i64, ((x % 1.0) * 1e9) as u32)
+                .unwrap();
+            datetime.format("%H:%M:%S").to_string()
+        } else {
+            format!("{:.0}", x)
         }
     }
 }
@@ -131,13 +149,14 @@ impl eframe::App for LivePlotApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             let data_lock = self.data.lock().unwrap();
 
-            let (first_seq, last_seq) =
+            let (first_x, last_x) =
                 if let (Some(f), Some(l)) = (data_lock.front(), data_lock.back()) {
-                    (f.seq as f64, l.seq as f64)
+                    (f.x, l.x)
                 } else {
                     (0.0, 0.0)
                 };
 
+            // --- 1. HEADER CONTROLS ---
             ui.horizontal(|ui| {
                 ui.heading(&self.title);
                 if self.auto_follow {
@@ -145,19 +164,17 @@ impl eframe::App for LivePlotApp {
                 }
                 ui.separator();
                 ui.label("Zoom:");
-
                 let min_zoom = self.default_viewport_width / self.max_buffer_size as f64;
                 let slider_width = (ui.available_width() - 110.0).max(50.0);
-
-                let zoom_slider = ui.add_sized(
-                    [slider_width, ui.spacing().interact_size.y],
-                    egui::Slider::new(&mut self.zoom_factor, min_zoom..=20.0).show_value(false),
-                );
-
-                if zoom_slider.changed() {
+                if ui
+                    .add_sized(
+                        [slider_width, ui.spacing().interact_size.y],
+                        egui::Slider::new(&mut self.zoom_factor, min_zoom..=20.0).show_value(false),
+                    )
+                    .changed()
+                {
                     self.auto_follow = false;
                 }
-
                 if ui.button("Reset View").clicked() {
                     self.zoom_factor = 1.0;
                     self.auto_follow = true;
@@ -166,35 +183,49 @@ impl eframe::App for LivePlotApp {
 
             let current_view_width = self.default_viewport_width / self.zoom_factor;
             if self.auto_follow {
-                self.scroll_offset = (last_seq - current_view_width).max(first_seq);
+                self.scroll_offset = (last_x - current_view_width).max(first_x);
             }
 
+            // --- 2. THE PLOT ---
+            let is_time = self.is_time_mode;
             let num_series = self.labels.len();
             let mut plot = Plot::new("live_plot")
-                .view_aspect(ui.available_width() / (ui.available_height() - 95.0).max(1.0))
+                .view_aspect(ui.available_width() / (ui.available_height() - 110.0).max(1.0))
                 .auto_bounds([false, false].into())
                 .allow_zoom(true)
                 .allow_drag(true)
-                .label_formatter(|name, value| {
-                    format!("Series: {}\nVal: {:.4}\nSeq: {:.0}", name, value.y, value.x)
+                .x_axis_formatter(move |mark, _range| {
+                    if is_time {
+                        let dt = Local.timestamp_opt(mark.value as i64, 0).unwrap();
+                        dt.format("%H:%M:%S").to_string()
+                    } else {
+                        format!("{:.0}", mark.value)
+                    }
+                })
+                .label_formatter(move |name, value| {
+                    let x_str = if is_time {
+                        let dt = Local
+                            .timestamp_opt(value.x as i64, ((value.x % 1.0) * 1e9) as u32)
+                            .unwrap();
+                        dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+                    } else {
+                        format!("{:.0}", value.x)
+                    };
+                    format!("Series: {}\nVal: {:.4}\nX: {}", name, value.y, x_str)
                 });
 
             for &y in &self.include_y_values {
                 plot = plot.include_y(y);
             }
-
             if num_series > 1 {
                 plot = plot.legend(Legend::default().position(self.legend_corner));
             }
 
             plot.show(ui, |plot_ui| {
                 let bounds = plot_ui.plot_bounds();
-
-                // Detection: use raw_scroll_delta for newer egui compatibility
-                let interaction = plot_ui.pointer_coordinate_drag_delta().length() > 0.0
-                    || plot_ui.ctx().input(|i| i.raw_scroll_delta.y).abs() > 0.0;
-
-                if interaction {
+                if plot_ui.pointer_coordinate_drag_delta().length() > 0.0
+                    || plot_ui.ctx().input(|i| i.raw_scroll_delta.y).abs() > 0.0
+                {
                     self.auto_follow = false;
                 }
 
@@ -202,7 +233,7 @@ impl eframe::App for LivePlotApp {
                     let mut min_v = f64::INFINITY;
                     let mut max_v = f64::NEG_INFINITY;
                     for dp in data_lock.iter() {
-                        if (dp.seq as f64) >= self.scroll_offset {
+                        if dp.x >= self.scroll_offset {
                             for &v in &dp.values {
                                 min_v = min_v.min(v);
                                 max_v = max_v.max(v);
@@ -213,32 +244,25 @@ impl eframe::App for LivePlotApp {
                         min_v = min_v.min(y);
                         max_v = max_v.max(y);
                     }
-
                     let y_range = if min_v.is_infinite() {
                         (0.0, 1.0)
                     } else {
                         let pad = (max_v - min_v).max(0.1) * 0.05;
                         (min_v - pad, max_v + pad)
                     };
-
                     plot_ui.set_plot_bounds(PlotBounds::from_min_max(
                         [self.scroll_offset, y_range.0],
                         [self.scroll_offset + current_view_width, y_range.1],
                     ));
                 } else {
-                    // Sync state from manual panning
                     self.scroll_offset = bounds.min()[0];
                     if bounds.width() > 0.0 {
                         self.zoom_factor = self.default_viewport_width / bounds.width();
                     }
                 }
 
-                // Render lines from all data in buffer
                 for i in 0..num_series {
-                    let points: PlotPoints = data_lock
-                        .iter()
-                        .map(|p| [p.seq as f64, p.values[i]])
-                        .collect();
+                    let points: PlotPoints = data_lock.iter().map(|p| [p.x, p.values[i]]).collect();
                     plot_ui.line(
                         Line::new(points)
                             .name(&self.labels[i])
@@ -247,29 +271,46 @@ impl eframe::App for LivePlotApp {
                 }
             });
 
+            // --- 3. FOOTER HISTORY SLIDER ---
             ui.add_space(10.0);
-            ui.label("History Scroll (Drag to far right for LIVE):");
-            let scroll_max = (last_seq - current_view_width).max(first_seq);
+            let scroll_max = (last_x - current_view_width).max(first_x);
+            ui.horizontal(|ui| {
+                ui.label("History:");
+                if self.is_time_mode {
+                    ui.weak(format!(
+                        "From {} to {}",
+                        self.format_x(first_x),
+                        self.format_x(last_x)
+                    ));
+                }
+            });
 
             let full_width = ui.available_width();
-            let scroll_bar = ui.add_sized(
-                [full_width, ui.spacing().interact_size.y],
-                egui::Slider::new(&mut self.scroll_offset, first_seq..=scroll_max)
-                    .show_value(false),
-            );
-
-            if scroll_bar.changed() {
+            if ui
+                .add_sized(
+                    [full_width, ui.spacing().interact_size.y],
+                    egui::Slider::new(&mut self.scroll_offset, first_x..=scroll_max)
+                        .show_value(false),
+                )
+                .changed()
+            {
                 self.auto_follow = self.scroll_offset >= (scroll_max - 0.01);
             }
         });
 
-        // Repaint is requested only when data arrives in the thread below
+        ctx.request_repaint();
     }
 }
 
 fn main() {
     let args = Args::parse();
-    let expected_cols = args.labels.as_ref().map_or(1, |l| l.len());
+    let is_time_mode = args.time;
+    let label_count = args.labels.as_ref().map_or(1, |l| l.len());
+    let expected_cols = if is_time_mode {
+        label_count + 1
+    } else {
+        label_count
+    };
     let max_points = args.max_points;
 
     let data_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(max_points)));
@@ -280,6 +321,7 @@ fn main() {
         ..Default::default()
     };
 
+    let app_args = args.clone();
     eframe::run_native(
         "Live Plotter",
         options,
@@ -288,7 +330,7 @@ fn main() {
             thread::spawn(move || {
                 let stdin = io::stdin();
                 let mut sequence_counter: u64 = 0;
-                for line in stdin.lock().lines() {
+                for (line_idx, line) in stdin.lock().lines().enumerate() {
                     if let Ok(line_str) = line {
                         let trimmed = line_str.trim();
                         if trimmed.is_empty() {
@@ -302,33 +344,38 @@ fn main() {
 
                         if values.len() != expected_cols {
                             eprintln!(
-                                "FATAL ERROR: expected {} columns, found {}.",
+                                "FATAL ERROR (line {}): expected {} columns, found {}.",
+                                line_idx + 1,
                                 expected_cols,
                                 values.len()
                             );
                             process::exit(1);
                         }
 
+                        let (x, series_data) = if is_time_mode {
+                            (values[0], values[1..].to_vec())
+                        } else {
+                            (sequence_counter as f64, values)
+                        };
+
                         {
                             let mut buffer = data_buffer_stdin.lock().unwrap();
                             buffer.push_back(DataPoint {
-                                seq: sequence_counter,
-                                values,
+                                x,
+                                values: series_data,
                             });
                             sequence_counter += 1;
                             if buffer.len() > max_points {
                                 buffer.pop_front();
                             }
                         }
-
-                        // Only repaint when data actually arrives
                         ctx.request_repaint();
                     } else {
                         break;
                     }
                 }
             });
-            Ok(Box::new(LivePlotApp::new(args, data_buffer)))
+            Ok(Box::new(LivePlotApp::new(app_args, data_buffer)))
         }),
     )
     .unwrap();

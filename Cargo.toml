@@ -8,3 +8,4 @@ eframe = "0.28"
 egui_plot = "0.28"
 egui = "0.28"
 clap = { version = "4.4", features = ["derive"] }
+chrono = { version = "0.4", features = ["clock"] } # Added for time formatting
