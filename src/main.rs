@@ -10,7 +10,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "Live Multi-Series Plotter with Time Support")]
+#[command(
+    author,
+    version,
+    about = "Live Multi-Series Plotter with Timestamp Support"
+)]
 struct Args {
     /// Maximum number of data points to display in the total buffer per series
     #[arg(short, long, default_value_t = 10000)]
@@ -22,9 +26,9 @@ struct Args {
 
     /// Interpret the first column as a Unix timestamp (seconds since epoch)
     #[arg(short, long, default_value_t = false)]
-    time: bool,
+    timestamp: bool,
 
-    /// Y-axis values that should always be visible
+    /// Y-axis values that should always be visible (baseline/ceiling)
     #[arg(long, num_args = 1..)]
     include_y: Vec<f64>,
 
@@ -46,7 +50,7 @@ struct Args {
 }
 
 struct DataPoint {
-    x: f64, // Either sequence number or unix timestamp
+    x: f64, // Sequence number OR unix timestamp
     values: Vec<f64>,
 }
 
@@ -81,6 +85,7 @@ impl LivePlotApp {
             }
         };
 
+        // Qualitative high-contrast palette
         let palette = vec![
             Color32::from_rgb(255, 85, 85),
             Color32::from_rgb(85, 255, 85),
@@ -123,7 +128,7 @@ impl LivePlotApp {
             colors,
             title: args.title,
             legend_corner,
-            is_time_mode: args.time,
+            is_time_mode: args.timestamp, // Flag from --timestamp
             default_viewport_width: args.viewport_width,
             max_buffer_size: args.max_points,
             zoom_factor: 1.0,
@@ -223,6 +228,7 @@ impl eframe::App for LivePlotApp {
 
             plot.show(ui, |plot_ui| {
                 let bounds = plot_ui.plot_bounds();
+                // Detected manual interaction to pause LIVE mode
                 if plot_ui.pointer_coordinate_drag_delta().length() > 0.0
                     || plot_ui.ctx().input(|i| i.raw_scroll_delta.y).abs() > 0.0
                 {
@@ -255,6 +261,7 @@ impl eframe::App for LivePlotApp {
                         [self.scroll_offset + current_view_width, y_range.1],
                     ));
                 } else {
+                    // Sync internal state from visual panning
                     self.scroll_offset = bounds.min()[0];
                     if bounds.width() > 0.0 {
                         self.zoom_factor = self.default_viewport_width / bounds.width();
@@ -304,9 +311,10 @@ impl eframe::App for LivePlotApp {
 
 fn main() {
     let args = Args::parse();
-    let is_time_mode = args.time;
+    let is_timestamp_mode = args.timestamp;
     let label_count = args.labels.as_ref().map_or(1, |l| l.len());
-    let expected_cols = if is_time_mode {
+    // In timestamp mode, we expect one extra column at the start
+    let expected_cols = if is_timestamp_mode {
         label_count + 1
     } else {
         label_count
@@ -352,7 +360,7 @@ fn main() {
                             process::exit(1);
                         }
 
-                        let (x, series_data) = if is_time_mode {
+                        let (x, series_data) = if is_timestamp_mode {
                             (values[0], values[1..].to_vec())
                         } else {
                             (sequence_counter as f64, values)
