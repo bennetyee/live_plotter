@@ -6,21 +6,18 @@ use egui_plot::{Corner, Legend, Line, Plot, PlotBounds, PlotPoints};
 use std::collections::VecDeque;
 use std::io::{self, BufRead};
 use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[derive(Parser, Debug, Clone)]
-#[command(
-    author,
-    version,
-    about = "Live Multi-Series Plotter with Timestamp Support"
-)]
+#[command(author, version, about = "Live Multi-Series Plotter")]
 struct Args {
     /// Maximum number of data points to display in the total buffer per series
     #[arg(short, long, default_value_t = 10000)]
     max_points: usize,
 
-    /// Initial number of X-axis units visible in the viewport (seconds or sequence count)
+    /// Initial number of X-axis units visible in the viewport
     #[arg(short, long, default_value_t = 500.0)]
     viewport_width: f64,
 
@@ -40,8 +37,8 @@ struct Args {
     #[arg(short, long, num_args = 1..)]
     colors: Option<Vec<String>>,
 
-    /// The title displayed at the top of the graph
-    #[arg(short, long, default_value = "Live Time-Series Feed")]
+    /// The title displayed at the top of the graph (Long form only)
+    #[arg(long, default_value = "Live Time-Series Feed")]
     title: String,
 
     /// Legend position: LeftTop, RightTop, LeftBottom, RightBottom
@@ -50,12 +47,13 @@ struct Args {
 }
 
 struct DataPoint {
-    x: f64, // Sequence number OR unix timestamp
+    x: f64,
     values: Vec<f64>,
 }
 
 struct LivePlotApp {
     data: Arc<Mutex<VecDeque<DataPoint>>>,
+    stream_ended: Arc<AtomicBool>,
     include_y_values: Vec<f64>,
     labels: Vec<String>,
     colors: Vec<Color32>,
@@ -63,7 +61,6 @@ struct LivePlotApp {
     legend_corner: Corner,
     is_time_mode: bool,
 
-    // Viewport State
     default_viewport_width: f64,
     max_buffer_size: usize,
     zoom_factor: f64,
@@ -72,7 +69,11 @@ struct LivePlotApp {
 }
 
 impl LivePlotApp {
-    fn new(args: Args, data: Arc<Mutex<VecDeque<DataPoint>>>) -> Self {
+    fn new(
+        args: Args,
+        data: Arc<Mutex<VecDeque<DataPoint>>>,
+        stream_ended: Arc<AtomicBool>,
+    ) -> Self {
         let labels = args.labels.unwrap_or_else(|| vec!["Series 1".to_string()]);
         let legend_corner = match args.legend_pos.to_lowercase().as_str() {
             "lefttop" => Corner::LeftTop,
@@ -85,7 +86,6 @@ impl LivePlotApp {
             }
         };
 
-        // Qualitative high-contrast palette
         let palette = vec![
             Color32::from_rgb(255, 85, 85),
             Color32::from_rgb(85, 255, 85),
@@ -123,12 +123,13 @@ impl LivePlotApp {
 
         Self {
             data,
+            stream_ended,
             include_y_values: args.include_y,
             labels,
             colors,
             title: args.title,
             legend_corner,
-            is_time_mode: args.timestamp, // Flag from --timestamp
+            is_time_mode: args.timestamp,
             default_viewport_width: args.viewport_width,
             max_buffer_size: args.max_points,
             zoom_factor: 1.0,
@@ -139,10 +140,13 @@ impl LivePlotApp {
 
     fn format_x(&self, x: f64) -> String {
         if self.is_time_mode {
-            let datetime: DateTime<Local> = Local
+            if let Some(dt) = Local
                 .timestamp_opt(x as i64, ((x % 1.0) * 1e9) as u32)
-                .unwrap();
-            datetime.format("%H:%M:%S").to_string()
+                .single()
+            {
+                return dt.format("%H:%M:%S").to_string();
+            }
+            "Invalid".to_string()
         } else {
             format!("{:.0}", x)
         }
@@ -164,9 +168,13 @@ impl eframe::App for LivePlotApp {
             // --- 1. HEADER CONTROLS ---
             ui.horizontal(|ui| {
                 ui.heading(&self.title);
-                if self.auto_follow {
-                    ui.colored_label(Color32::from_rgb(100, 200, 255), "• LIVE");
+
+                if self.stream_ended.load(Ordering::Relaxed) {
+                    ui.colored_label(Color32::GOLD, " ⚠️ Stream Ended (EOF)");
+                } else if self.auto_follow {
+                    ui.colored_label(Color32::from_rgb(100, 200, 255), " • LIVE");
                 }
+
                 ui.separator();
                 ui.label("Zoom:");
                 let min_zoom = self.default_viewport_width / self.max_buffer_size as f64;
@@ -201,18 +209,22 @@ impl eframe::App for LivePlotApp {
                 .allow_drag(true)
                 .x_axis_formatter(move |mark, _range| {
                     if is_time {
-                        let dt = Local.timestamp_opt(mark.value as i64, 0).unwrap();
-                        dt.format("%H:%M:%S").to_string()
-                    } else {
-                        format!("{:.0}", mark.value)
+                        if let Some(dt) = Local.timestamp_opt(mark.value as i64, 0).single() {
+                            return dt.format("%H:%M:%S").to_string();
+                        }
                     }
+                    format!("{:.0}", mark.value)
                 })
                 .label_formatter(move |name, value| {
                     let x_str = if is_time {
-                        let dt = Local
+                        if let Some(dt) = Local
                             .timestamp_opt(value.x as i64, ((value.x % 1.0) * 1e9) as u32)
-                            .unwrap();
-                        dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+                            .single()
+                        {
+                            dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+                        } else {
+                            "Invalid".to_string()
+                        }
                     } else {
                         format!("{:.0}", value.x)
                     };
@@ -228,7 +240,6 @@ impl eframe::App for LivePlotApp {
 
             plot.show(ui, |plot_ui| {
                 let bounds = plot_ui.plot_bounds();
-                // Detected manual interaction to pause LIVE mode
                 if plot_ui.pointer_coordinate_drag_delta().length() > 0.0
                     || plot_ui.ctx().input(|i| i.raw_scroll_delta.y).abs() > 0.0
                 {
@@ -261,7 +272,6 @@ impl eframe::App for LivePlotApp {
                         [self.scroll_offset + current_view_width, y_range.1],
                     ));
                 } else {
-                    // Sync internal state from visual panning
                     self.scroll_offset = bounds.min()[0];
                     if bounds.width() > 0.0 {
                         self.zoom_factor = self.default_viewport_width / bounds.width();
@@ -278,7 +288,6 @@ impl eframe::App for LivePlotApp {
                 }
             });
 
-            // --- 3. FOOTER HISTORY SLIDER ---
             ui.add_space(10.0);
             let scroll_max = (last_x - current_view_width).max(first_x);
             ui.horizontal(|ui| {
@@ -313,7 +322,6 @@ fn main() {
     let args = Args::parse();
     let is_timestamp_mode = args.timestamp;
     let label_count = args.labels.as_ref().map_or(1, |l| l.len());
-    // In timestamp mode, we expect one extra column at the start
     let expected_cols = if is_timestamp_mode {
         label_count + 1
     } else {
@@ -323,6 +331,8 @@ fn main() {
 
     let data_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(max_points)));
     let data_buffer_stdin = Arc::clone(&data_buffer);
+    let stream_ended = Arc::new(AtomicBool::new(false));
+    let stream_ended_thread = Arc::clone(&stream_ended);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 800.0]),
@@ -382,8 +392,14 @@ fn main() {
                         break;
                     }
                 }
+                stream_ended_thread.store(true, Ordering::Relaxed);
+                ctx.request_repaint();
             });
-            Ok(Box::new(LivePlotApp::new(app_args, data_buffer)))
+            Ok(Box::new(LivePlotApp::new(
+                app_args,
+                data_buffer,
+                stream_ended,
+            )))
         }),
     )
     .unwrap();
