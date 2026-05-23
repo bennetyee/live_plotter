@@ -22,14 +22,12 @@ struct Args {
     include_y: Vec<f64>,
     #[arg(short, long, num_args = 1..)]
     labels: Option<Vec<String>>,
-    /// Sort labels alphabetically (default is command-line order)
     #[arg(long, default_value_t = false)]
     sort_labels: bool,
     #[arg(short, long, num_args = 1..)]
     colors: Option<Vec<String>>,
     #[arg(long, default_value = "Live Time-Series Feed")]
     title: String,
-    /// Legend position: LeftTop, RightTop, LeftBottom, RightBottom, or None
     #[arg(long, default_value = "LeftTop")]
     legend_pos: String,
 }
@@ -47,12 +45,15 @@ struct LivePlotApp {
     legend_corner: Option<Corner>,
     is_ts_mode: bool,
 
+    side_panel_collapsed: bool,
+    side_panel_expanded: bool,
+
     default_width: f64,
     x_zoom: f64,
     x_center: f64,
     y_zoom: f64,
     y_center: f64,
-    y_nat_h: f64,
+    y_nat_h: f64, // The height of the plot when y_zoom is 1.0
     auto_follow: bool,
 }
 
@@ -64,7 +65,6 @@ impl LivePlotApp {
         labels: Vec<String>,
     ) -> Self {
         let visible = vec![true; labels.len()];
-
         let legend_corner = match args.legend_pos.to_lowercase().as_str() {
             "none" => None,
             "lefttop" => Some(Corner::LeftTop),
@@ -73,7 +73,7 @@ impl LivePlotApp {
             "rightbottom" => Some(Corner::RightBottom),
             _ => {
                 eprintln!("FATAL ERROR: Invalid --legend-pos '{}'.", args.legend_pos);
-                eprintln!("Accepted values: LeftTop, RightTop, LeftBottom, RightBottom, None");
+                eprintln!("Valid values: LeftTop, RightTop, LeftBottom, RightBottom, None");
                 process::exit(1);
             }
         };
@@ -123,6 +123,8 @@ impl LivePlotApp {
             title: args.title,
             legend_corner,
             is_ts_mode: args.timestamp,
+            side_panel_collapsed: false,
+            side_panel_expanded: false,
             default_width: args.viewport_width,
             x_zoom: 1.0,
             x_center: 0.0,
@@ -148,43 +150,85 @@ fn format_x_val(x: f64, is_ts: bool) -> String {
 
 impl eframe::App for LivePlotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // --- SIDE PANEL ---
-        egui::SidePanel::right("vis_panel").show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.heading("Visibility");
-            });
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui.button("All").clicked() {
-                    for v in self.visible.iter_mut() {
-                        *v = true;
-                    }
-                }
-                if ui.button("None").clicked() {
-                    for v in self.visible.iter_mut() {
-                        *v = false;
-                    }
-                }
-            });
-            ui.separator();
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for i in 0..self.labels.len() {
-                    ui.horizontal(|ui| {
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 2.0, self.colors[i]);
-                        // Fix for E0599: Manual selectable toggle logic
+        // --- 1. SIDE PANEL (VISIBILITY) ---
+        let panel_width = if self.side_panel_collapsed {
+            30.0
+        } else if self.side_panel_expanded {
+            450.0
+        } else {
+            220.0
+        };
+
+        egui::SidePanel::right("vis_panel")
+            .resizable(false)
+            .exact_width(panel_width) // exact_width forces the CentralPanel to expand correctly
+            .show(ctx, |ui| {
+                if self.side_panel_collapsed {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(10.0);
                         if ui
-                            .selectable_label(self.visible[i], &self.labels[i])
+                            .button("⏴")
+                            .on_hover_text("Show Visibility Panel")
                             .clicked()
                         {
-                            self.visible[i] = !self.visible[i];
+                            self.side_panel_collapsed = false;
+                        }
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("⏵")
+                            .on_hover_text("Hide Visibility Panel")
+                            .clicked()
+                        {
+                            self.side_panel_collapsed = true;
+                        }
+                        if ui
+                            .button(if self.side_panel_expanded {
+                                "➖"
+                            } else {
+                                "⛶"
+                            })
+                            .clicked()
+                        {
+                            self.side_panel_expanded = !self.side_panel_expanded;
+                        }
+                        ui.heading("Visibility");
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("All").clicked() {
+                            for v in self.visible.iter_mut() {
+                                *v = true;
+                            }
+                        }
+                        if ui.button("None").clicked() {
+                            for v in self.visible.iter_mut() {
+                                *v = false;
+                            }
+                        }
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for i in 0..self.labels.len() {
+                            ui.horizontal(|ui| {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(12.0, 12.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect_filled(rect, 2.0, self.colors[i]);
+                                if ui
+                                    .selectable_label(self.visible[i], &self.labels[i])
+                                    .clicked()
+                                {
+                                    self.visible[i] = !self.visible[i];
+                                }
+                            });
                         }
                     });
                 }
             });
-        });
 
+        // --- 2. MAIN VIEW ---
         egui::CentralPanel::default().show(ctx, |ui| {
             let mut first_x = 0.0;
             let mut last_x = 0.0;
@@ -201,7 +245,7 @@ impl eframe::App for LivePlotApp {
             let mut interaction_triggered = false;
             let layer_id = ui.layer_id();
 
-            // --- HEADER ---
+            // HEADER
             ui.horizontal(|ui| {
                 ui.heading(&self.title);
                 if self.stream_ended.load(Ordering::Relaxed) {
@@ -211,19 +255,23 @@ impl eframe::App for LivePlotApp {
                 }
                 ui.separator();
                 ui.label("X-Zoom:");
-                let min_z =
+
+                let cur_x_center = self.x_center;
+                let slider_w = (ui.available_width() - 120.0).max(50.0);
+                let min_zx =
                     (self.default_width / (last_x - first_x).max(self.default_width)).max(0.0001);
                 let zx_resp = ui.add_sized(
-                    [(ui.available_width() - 120.0).max(50.0), 20.0],
-                    egui::Slider::new(&mut self.x_zoom, min_z..=2000.0)
+                    [slider_w, 20.0],
+                    egui::Slider::new(&mut self.x_zoom, min_zx..=1000.0)
                         .show_value(false)
                         .logarithmic(true),
                 );
+
                 if zx_resp.changed() {
                     self.auto_follow = false;
                     interaction_triggered = true;
+                    self.x_center = cur_x_center; // Keep center fixed
                 }
-
                 if ui.button("Reset Viewport").clicked() {
                     self.x_zoom = 1.0;
                     self.y_zoom = 1.0;
@@ -236,23 +284,24 @@ impl eframe::App for LivePlotApp {
                 self.x_center = last_x - (self.default_width / self.x_zoom / 2.0);
             }
 
-            // --- BODY (Stretch Layout) ---
+            // BODY
             let body_layout =
                 egui::Layout::left_to_right(egui::Align::Min).with_cross_justify(true);
             ui.with_layout(body_layout, |ui| {
                 let vy_resp = ui.add_sized(
                     [20.0, ui.available_height()],
-                    egui::Slider::new(&mut self.y_zoom, 0.5..=20.0)
+                    egui::Slider::new(&mut self.y_zoom, 0.1..=50.0)
                         .vertical()
                         .show_value(false)
                         .logarithmic(true),
                 );
+
                 if vy_resp.changed() {
                     self.auto_follow = false;
                     interaction_triggered = true;
                 }
 
-                let mut plot = Plot::new("lp")
+                let mut plot = Plot::new("live_plot")
                     .height(ui.available_height())
                     .width(ui.available_width())
                     .auto_bounds([false, false].into())
@@ -269,7 +318,6 @@ impl eframe::App for LivePlotApp {
                 if let Some(pos) = self.legend_corner {
                     plot = plot.legend(Legend::default().position(pos));
                 }
-
                 for &y in &self.include_y_values {
                     plot = plot.include_y(y);
                 }
@@ -280,8 +328,10 @@ impl eframe::App for LivePlotApp {
                 let is_ts = self.is_ts_mode;
                 let include_y = self.include_y_values.clone();
                 let visible = self.visible.clone();
+                let def_w = self.default_width;
 
                 let plot_res = plot.show(ui, |plot_ui| {
+                    let bounds = plot_ui.plot_bounds();
                     if plot_ui.pointer_coordinate_drag_delta().length() > 0.0
                         || plot_ui.ctx().input(|i| i.raw_scroll_delta.y).abs() > 0.0
                     {
@@ -289,55 +339,60 @@ impl eframe::App for LivePlotApp {
                     }
 
                     if self.auto_follow {
-                        let mut min_y = f64::INFINITY;
-                        let mut max_y = f64::NEG_INFINITY;
+                        let mut min_y_vis = f64::INFINITY;
+                        let mut max_y_vis = f64::NEG_INFINITY;
                         let d = data_arc.lock().unwrap();
-                        let x_start = last_x - (self.default_width / self.x_zoom);
+                        let x_start = last_x - (def_w / self.x_zoom);
                         for (i, b) in d.iter().enumerate() {
                             if !visible[i] {
                                 continue;
                             }
                             for p in b.iter().filter(|p| p[0] >= x_start) {
-                                min_y = min_y.min(p[1]);
-                                max_y = max_y.max(p[1]);
+                                min_y_vis = min_y_vis.min(p[1]);
+                                max_y_vis = max_y_vis.max(p[1]);
                             }
                         }
                         for &y in &include_y {
-                            min_y = min_y.min(y);
-                            max_y = max_y.max(y);
+                            min_y_vis = min_y_vis.min(y);
+                            max_y_vis = max_y_vis.max(y);
                         }
-                        let base = if min_y.is_infinite() {
+                        let base = if min_y_vis.is_infinite() {
                             (-1.0, 1.0)
                         } else {
-                            let p = (max_y - min_y).max(0.1) * 0.05;
-                            (min_y - p, max_y + p)
+                            let p = (max_y_vis - min_y_vis).max(0.1) * 0.05;
+                            (min_y_vis - p, max_y_vis + p)
                         };
+
                         self.y_center = (base.0 + base.1) / 2.0;
                         self.y_nat_h = (base.1 - base.0).max(0.001);
                         self.y_zoom = 1.0;
+                        self.x_center = last_x - (def_w / self.x_zoom / 2.0);
+
                         plot_ui.set_plot_bounds(PlotBounds::from_min_max(
                             [x_start, base.0],
                             [last_x, base.1],
                         ));
                     } else if interaction_triggered {
-                        let hw = (self.default_width / self.x_zoom) / 2.0;
+                        // Sliders drive the camera
+                        let hw = (def_w / self.x_zoom) / 2.0;
                         let hh = (self.y_nat_h / self.y_zoom) / 2.0;
                         plot_ui.set_plot_bounds(PlotBounds::from_min_max(
                             [self.x_center - hw, self.y_center - hh],
                             [self.x_center + hw, self.y_center + hh],
                         ));
                     } else {
-                        let b = plot_ui.plot_bounds();
-                        self.x_center = b.center().x;
-                        self.y_center = b.center().y;
-                        if b.width() > 0.0 {
-                            self.x_zoom = self.default_width / b.width();
+                        // Camera drives the sliders (sync back)
+                        self.x_center = bounds.center().x;
+                        self.y_center = bounds.center().y;
+                        if bounds.width() > 0.0 {
+                            self.x_zoom = def_w / bounds.width();
                         }
-                        if b.height() > 0.0 {
-                            self.y_zoom = (self.y_nat_h / b.height()).max(0.001);
+                        if bounds.height() > 0.0 {
+                            self.y_zoom = (self.y_nat_h / bounds.height()).max(0.001);
                         }
                     }
 
+                    // Render lines
                     let d = data_arc.lock().unwrap();
                     for (i, b) in d.iter().enumerate() {
                         if !visible[i] {
@@ -365,6 +420,7 @@ impl eframe::App for LivePlotApp {
                         );
                     }
 
+                    // Hover Tooltip
                     if let Some(mp) = plot_ui.pointer_coordinate() {
                         if let Some(rb) = d.get(0) {
                             let idx = rb
@@ -418,19 +474,15 @@ impl eframe::App for LivePlotApp {
 fn main() {
     let args = Args::parse();
     let is_ts = args.timestamp;
-
-    // Determine label ordering
     let raw_labels = args
         .labels
         .clone()
         .unwrap_or_else(|| vec!["Series 1".to_string()]);
     let label_count = raw_labels.len();
-
     let mut map: Vec<(usize, String)> = raw_labels.into_iter().enumerate().collect();
     if args.sort_labels {
         map.sort_by(|a, b| a.1.cmp(&b.1));
     }
-
     let display_labels: Vec<String> = map.iter().map(|m| m.1.clone()).collect();
     let input_to_display_map: Vec<usize> = {
         let mut inv = vec![0; label_count];
@@ -446,16 +498,16 @@ fn main() {
     let stream_ended = Arc::new(AtomicBool::new(false));
     let stream_ended_thread = Arc::clone(&stream_ended);
     let max_pts = args.max_points;
-    let app_args = args.clone();
 
     eframe::run_native(
         "Live Plotter",
         eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default().with_inner_size([1300.0, 800.0]),
+            viewport: egui::ViewportBuilder::default().with_inner_size([1250.0, 750.0]),
             ..Default::default()
         },
         Box::new(move |cc| {
             let ctx = cc.egui_ctx.clone();
+            let app_args = args.clone();
             thread::spawn(move || {
                 let stdin = io::stdin();
                 let mut seq = 0;
@@ -471,7 +523,7 @@ fn main() {
                             .filter_map(|s| s.parse().ok())
                             .collect();
                         if vals.len() != expected {
-                            eprintln!("FATAL ERROR: schema mismatch.");
+                            eprintln!("FATAL: schema mismatch.");
                             process::exit(1);
                         }
                         let (x, series) = if is_ts {
