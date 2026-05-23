@@ -2,7 +2,7 @@ use chrono::{Local, TimeZone};
 use clap::Parser;
 use eframe::egui;
 use egui::Color32;
-use egui_plot::{Corner, Legend, Line, PlotPoints};
+use egui_plot::{Corner, Legend, Line, Plot, PlotBounds, PlotPoints};
 use std::io::{self, BufRead};
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,6 +30,7 @@ struct Args {
     legend_pos: String,
 }
 
+// Storage for Zero-Copy rendering (contiguous floats)
 type SeriesBuffer = Vec<[f64; 2]>;
 
 struct LivePlotApp {
@@ -44,6 +45,7 @@ struct LivePlotApp {
 
     default_width: f64,
     zoom_factor: f64,
+    y_zoom_factor: f64,
     scroll_offset: f64,
     auto_follow: bool,
 }
@@ -51,6 +53,7 @@ struct LivePlotApp {
 impl LivePlotApp {
     fn new(args: Args, data: Arc<Mutex<Vec<SeriesBuffer>>>, stream_ended: Arc<AtomicBool>) -> Self {
         let labels = args.labels.unwrap_or_else(|| vec!["Series 1".to_string()]);
+
         let legend_corner = match args.legend_pos.to_lowercase().as_str() {
             "lefttop" => Corner::LeftTop,
             "righttop" => Corner::RightTop,
@@ -58,6 +61,7 @@ impl LivePlotApp {
             "rightbottom" => Corner::RightBottom,
             _ => {
                 eprintln!("FATAL ERROR: Invalid --legend-pos '{}'.", args.legend_pos);
+                eprintln!("Accepted values: LeftTop, RightTop, LeftBottom, RightBottom");
                 process::exit(1);
             }
         };
@@ -108,6 +112,7 @@ impl LivePlotApp {
             is_ts_mode: args.timestamp,
             default_width: args.viewport_width,
             zoom_factor: 1.0,
+            y_zoom_factor: 1.0,
             scroll_offset: 0.0,
             auto_follow: true,
         }
@@ -122,7 +127,7 @@ fn format_x_val(x: f64, is_ts: bool) -> String {
         {
             return dt.format("%H:%M:%S").to_string();
         }
-        "Invalid Time".to_string()
+        "Invalid".to_string()
     } else {
         format!("{:.0}", x)
     }
@@ -151,22 +156,21 @@ impl eframe::App for LivePlotApp {
             }
 
             let mut interaction_triggered = false;
-            let current_layer = ui.layer_id();
+            let layer_id = ui.layer_id();
 
-            // --- HEADER ---
+            // --- 1. HEADER (X-Zoom Control) ---
             ui.horizontal(|ui| {
                 ui.heading(&self.title);
                 if self.stream_ended.load(Ordering::Relaxed) {
-                    ui.colored_label(Color32::GOLD, "⚠️ Stream Ended");
+                    ui.colored_label(Color32::GOLD, "⚠️ Ended");
                 } else if self.auto_follow {
-                    ui.colored_label(Color32::from_rgb(100, 200, 255), "• LIVE");
+                    ui.colored_label(Color32::LIGHT_BLUE, "• LIVE");
                 }
                 ui.separator();
-                ui.label("Zoom:");
+                ui.label("X-Zoom:");
 
-                // FIXED CENTER LOGIC: Capture current center before slider changes zoom
                 let current_width = self.default_width / self.zoom_factor;
-                let current_center = self.scroll_offset + (current_width / 2.0);
+                let current_center_x = self.scroll_offset + (current_width / 2.0);
 
                 let slider_w = (ui.available_width() - 100.0).max(50.0);
                 let min_z =
@@ -181,13 +185,13 @@ impl eframe::App for LivePlotApp {
                 if z_resp.changed() {
                     self.auto_follow = false;
                     interaction_triggered = true;
-                    // Adjust scroll_offset to keep current_center fixed
                     let new_width = self.default_width / self.zoom_factor;
-                    self.scroll_offset = current_center - (new_width / 2.0);
+                    self.scroll_offset = current_center_x - (new_width / 2.0);
                 }
 
-                if ui.button("Reset View").clicked() {
+                if ui.button("Reset").clicked() {
                     self.zoom_factor = 1.0;
+                    self.y_zoom_factor = 1.0;
                     self.auto_follow = true;
                     interaction_triggered = true;
                 }
@@ -198,55 +202,80 @@ impl eframe::App for LivePlotApp {
                 self.scroll_offset = (last_x - view_width).max(first_x);
             }
 
-            // --- THE PLOT ---
-            let num_series = self.labels.len();
-            let mut plot = egui_plot::Plot::new("live_plot")
-                .view_aspect(ui.available_width() / (ui.available_height() - 30.0).max(1.0))
-                .auto_bounds([false, false].into())
-                .allow_zoom(true)
-                .allow_drag(true)
-                .show_x(false)
-                .show_y(false)
-                .label_formatter(|_, _| String::new())
-                .x_axis_formatter({
-                    let is_ts = self.is_ts_mode;
-                    move |mark, _| format_x_val(mark.value, is_ts)
-                });
-
-            for &y in &self.include_y_values {
-                plot = plot.include_y(y);
-            }
-            if num_series > 1 {
-                plot = plot.legend(egui_plot::Legend::default().position(self.legend_corner));
-            }
-
-            // Closure captures
+            // Clone data for closure
             let data_arc = self.data.clone();
             let is_ts = self.is_ts_mode;
             let include_y = self.include_y_values.clone();
-            let mut scroll_offset = self.scroll_offset;
-            let mut auto_follow = self.auto_follow;
-            let mut zoom_factor = self.zoom_factor;
-            let def_w = self.default_width;
             let labels = self.labels.clone();
             let colors = self.colors.clone();
 
-            let plot_res = plot.show(ui, |plot_ui| {
-                let data_lock = data_arc.lock().unwrap();
-                let bounds = plot_ui.plot_bounds();
-                let drag = plot_ui.pointer_coordinate_drag_delta().length() > 0.0;
-                let scroll = plot_ui.ctx().input(|i| i.raw_scroll_delta.y).abs() > 0.0;
+            let mut scroll_offset = self.scroll_offset;
+            let mut auto_follow = self.auto_follow;
+            let mut zoom_factor = self.zoom_factor;
+            let mut y_zoom_factor = self.y_zoom_factor;
+            let def_w = self.default_width;
 
-                if drag || scroll {
-                    auto_follow = false;
+            // --- 2. MAIN BODY (Vertical Slider + Full Height Plot) ---
+            // Using a specific layout to ensure the vertical slider and plot stretch
+            let body_layout =
+                egui::Layout::left_to_right(egui::Align::Min).with_cross_justify(true);
+
+            ui.with_layout(body_layout, |ui| {
+                // Vertical Slider
+                ui.add_sized(
+                    [20.0, ui.available_height()],
+                    egui::Slider::new(&mut y_zoom_factor, 0.1..=1000.0)
+                        .vertical()
+                        .show_value(false)
+                        .logarithmic(true),
+                );
+
+                if ui.input(|i| i.pointer.any_down())
+                    && ui
+                        .available_rect_before_wrap()
+                        .contains(ui.input(|i| i.pointer.interact_pos().unwrap_or_default()))
+                {
+                    // Check if slider was touched
                 }
 
-                if auto_follow || interaction_triggered {
-                    let mut min_y = f64::INFINITY;
-                    let mut max_y = f64::NEG_INFINITY;
-                    if auto_follow {
+                if y_zoom_factor != self.y_zoom_factor {
+                    auto_follow = false;
+                    interaction_triggered = true;
+                }
+
+                // Plot stretched to remaining width and height
+                let num_series = labels.len();
+                let plot = Plot::new("live_plot")
+                    .height(ui.available_height())
+                    .width(ui.available_width())
+                    .auto_bounds([false, false].into())
+                    .allow_zoom(true)
+                    .allow_drag(true)
+                    .show_x(false)
+                    .show_y(false)
+                    .label_formatter(|_, _| String::new())
+                    .x_axis_formatter(move |mark, _| format_x_val(mark.value, is_ts))
+                    .legend(Legend::default().position(self.legend_corner));
+
+                let plot = include_y.iter().fold(plot, |p, &y| p.include_y(y));
+
+                let plot_res = plot.show(ui, |plot_ui| {
+                    let data_lock = data_arc.lock().unwrap();
+                    let bounds = plot_ui.plot_bounds();
+
+                    if plot_ui.pointer_coordinate_drag_delta().length() > 0.0
+                        || plot_ui.ctx().input(|i| i.raw_scroll_delta.y).abs() > 0.0
+                    {
+                        auto_follow = false;
+                    }
+
+                    if auto_follow || interaction_triggered {
+                        let mut min_y = f64::INFINITY;
+                        let mut max_y = f64::NEG_INFINITY;
                         for buf in data_lock.iter() {
-                            for p in buf.iter().filter(|p| p[0] >= scroll_offset) {
+                            for p in buf.iter().filter(|p| {
+                                p[0] >= scroll_offset && p[0] <= scroll_offset + view_width
+                            }) {
                                 min_y = min_y.min(p[1]);
                                 max_y = max_y.max(p[1]);
                             }
@@ -255,102 +284,118 @@ impl eframe::App for LivePlotApp {
                             min_y = min_y.min(y);
                             max_y = max_y.max(y);
                         }
-                    }
-                    let range_y = if min_y.is_infinite() {
-                        (bounds.min()[1], bounds.max()[1])
+
+                        let base_range_y = if min_y.is_infinite() {
+                            (bounds.min()[1], bounds.max()[1])
+                        } else {
+                            let p = (max_y - min_y).max(0.1) * 0.05;
+                            (min_y - p, max_y + p)
+                        };
+
+                        let center_y = (base_range_y.0 + base_range_y.1) / 2.0;
+                        let half_h = ((base_range_y.1 - base_range_y.0) / 2.0) / y_zoom_factor;
+
+                        plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                            [scroll_offset, center_y - half_h],
+                            [scroll_offset + view_width, center_y + half_h],
+                        ));
                     } else {
-                        let p = (max_y - min_y).max(0.1) * 0.05;
-                        (min_y - p, max_y + p)
-                    };
-                    plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
-                        [scroll_offset, range_y.0],
-                        [scroll_offset + view_width, range_y.1],
-                    ));
-                } else {
-                    scroll_offset = bounds.min()[0];
-                    if bounds.width() > 0.0 {
-                        zoom_factor = def_w / bounds.width();
-                    }
-                }
+                        scroll_offset = bounds.min()[0];
+                        if bounds.width() > 0.0 {
+                            zoom_factor = def_w / bounds.width();
+                        }
 
-                // Zero-Copy Rendering: from_parametric_callback returning (f64, f64)
-                for (i, buffer) in data_lock.iter().enumerate() {
-                    let series_len = buffer.len();
-                    if series_len == 0 {
-                        continue;
-                    }
-
-                    let points = egui_plot::PlotPoints::from_parametric_callback(
-                        move |t| {
-                            let idx = t.round() as usize;
-                            if idx < series_len {
-                                let p = buffer[idx];
-                                (p[0], p[1])
-                            } else {
-                                (0.0, 0.0)
+                        let mut b_min = f64::INFINITY;
+                        let mut b_max = f64::NEG_INFINITY;
+                        for buf in data_lock.iter() {
+                            for p in buf
+                                .iter()
+                                .filter(|p| p[0] >= bounds.min()[0] && p[0] <= bounds.max()[0])
+                            {
+                                b_min = b_min.min(p[1]);
+                                b_max = b_max.max(p[1]);
                             }
-                        },
-                        0.0..=(series_len as f64 - 1.0),
-                        series_len,
-                    );
+                        }
+                        let b_h = (b_max - b_min).max(0.1);
+                        if bounds.height() > 0.0 {
+                            y_zoom_factor = (b_h / bounds.height()).max(0.001);
+                        }
+                    }
 
-                    plot_ui.line(
-                        egui_plot::Line::new(points)
-                            .name(&labels[i])
-                            .color(colors[i]),
-                    );
-                }
+                    // Zero-copy parametric rendering
+                    for (i, buffer) in data_lock.iter().enumerate() {
+                        let series_len = buffer.len();
+                        if series_len == 0 {
+                            continue;
+                        }
+                        let points = PlotPoints::from_parametric_callback(
+                            move |t| {
+                                let idx = t.round() as usize;
+                                if idx < series_len {
+                                    (buffer[idx][0], buffer[idx][1])
+                                } else {
+                                    (0.0, 0.0)
+                                }
+                            },
+                            0.0..=(series_len as f64 - 1.0),
+                            series_len,
+                        );
+                        plot_ui.line(Line::new(points).name(&labels[i]).color(colors[i]));
+                    }
 
-                // Binary Search Tooltip
-                if let Some(mouse_p) = plot_ui.pointer_coordinate() {
-                    if let Some(ref_buf) = data_lock.get(0) {
-                        let idx = ref_buf
-                            .binary_search_by(|p| p[0].partial_cmp(&mouse_p.x).unwrap())
-                            .unwrap_or_else(|e| e);
-                        let mut best = None;
-                        let mut best_dist = f64::INFINITY;
-                        for i in (idx.saturating_sub(1))..(idx + 1).min(ref_buf.len()) {
-                            for s_idx in 0..num_series {
-                                if let Some(val) = data_lock.get(s_idx).and_then(|b| b.get(i)) {
-                                    let dx = val[0] - mouse_p.x;
-                                    let dy = (val[1] - mouse_p.y)
-                                        * (bounds.width() / bounds.height().max(0.1));
-                                    let d = dx * dx + dy * dy;
-                                    if d < best_dist {
-                                        best_dist = d;
-                                        best = Some((s_idx, val[0], val[1]));
+                    // Hover Tooltip
+                    if let Some(mouse_p) = plot_ui.pointer_coordinate() {
+                        if let Some(ref_buf) = data_lock.get(0) {
+                            let idx = ref_buf
+                                .binary_search_by(|p| p[0].partial_cmp(&mouse_p.x).unwrap())
+                                .unwrap_or_else(|e| e);
+                            let mut best = None;
+                            let mut best_dist = f64::INFINITY;
+                            for i in (idx.saturating_sub(1))..(idx + 1).min(ref_buf.len()) {
+                                for s_idx in 0..num_series {
+                                    if let Some(val) = data_lock.get(s_idx).and_then(|b| b.get(i)) {
+                                        let dx = val[0] - mouse_p.x;
+                                        let dy = (val[1] - mouse_p.y)
+                                            * (bounds.width() / bounds.height().max(0.1));
+                                        let d = dx * dx + dy * dy;
+                                        if d < best_dist {
+                                            best_dist = d;
+                                            best = Some((s_idx, val[0], val[1]));
+                                        }
                                     }
                                 }
                             }
-                        }
-                        if let Some((s_idx, x, y)) = best {
-                            if best_dist < (bounds.width() * 0.015).powi(2) {
-                                let x_fmt = format_x_val(x, is_ts);
-                                let lbl = labels[s_idx].clone();
-                                egui::show_tooltip_at_pointer(
-                                    plot_ui.ctx(),
-                                    current_layer,
-                                    egui::Id::new("plot_tt"),
-                                    |ui: &mut egui::Ui| {
-                                        ui.label(format!(
-                                            "Series: {}\nVal: {:.4}\nX: {}",
-                                            lbl, y, x_fmt
-                                        ));
-                                    },
-                                );
+                            if let Some((s_idx, x, y)) = best {
+                                if best_dist < (bounds.width() * 0.015).powi(2) {
+                                    let x_fmt = format_x_val(x, is_ts);
+                                    let lbl = labels[s_idx].clone();
+                                    egui::show_tooltip_at_pointer(
+                                        plot_ui.ctx(),
+                                        layer_id,
+                                        egui::Id::new("plot_tt"),
+                                        |ui: &mut egui::Ui| {
+                                            ui.label(format!(
+                                                "Series: {}\nVal: {:.4}\nX: {}",
+                                                lbl, y, x_fmt
+                                            ));
+                                        },
+                                    );
+                                }
                             }
                         }
                     }
+                });
+
+                // Update state
+                self.auto_follow = auto_follow;
+                self.scroll_offset = scroll_offset;
+                self.zoom_factor = zoom_factor;
+                self.y_zoom_factor = y_zoom_factor;
+
+                if plot_res.response.dragged() || interaction_triggered {
+                    ui.ctx().request_repaint();
                 }
             });
-
-            self.auto_follow = auto_follow;
-            self.scroll_offset = scroll_offset;
-            self.zoom_factor = zoom_factor;
-
-            if plot_res.response.dragged() || interaction_triggered {
-                ui.ctx().request_repaint();
-            }
         });
     }
 }
@@ -394,7 +439,7 @@ fn main() {
                             .filter_map(|s| s.parse().ok())
                             .collect();
                         if vals.len() != expected {
-                            eprintln!("FATAL: line {} columns.", l_idx + 1);
+                            eprintln!("FATAL: line {} cols.", l_idx + 1);
                             process::exit(1);
                         }
                         let (x, series) = if is_ts {
