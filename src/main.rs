@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "Zero-Copy High-Performance Live Plotter")]
+#[command(author, version, about = "High-Performance Live Multi-Series Plotter")]
 struct Args {
     #[arg(short, long, default_value_t = 10000)]
     max_points: usize,
@@ -22,10 +22,14 @@ struct Args {
     include_y: Vec<f64>,
     #[arg(short, long, num_args = 1..)]
     labels: Option<Vec<String>>,
+    /// Sort labels alphabetically (default is command-line order)
+    #[arg(long, default_value_t = false)]
+    sort_labels: bool,
     #[arg(short, long, num_args = 1..)]
     colors: Option<Vec<String>>,
     #[arg(long, default_value = "Live Time-Series Feed")]
     title: String,
+    /// Legend position: LeftTop, RightTop, LeftBottom, RightBottom, or None
     #[arg(long, default_value = "LeftTop")]
     legend_pos: String,
 }
@@ -40,7 +44,7 @@ struct LivePlotApp {
     colors: Vec<Color32>,
     visible: Vec<bool>,
     title: String,
-    legend_corner: Corner,
+    legend_corner: Option<Corner>,
     is_ts_mode: bool,
 
     default_width: f64,
@@ -53,16 +57,25 @@ struct LivePlotApp {
 }
 
 impl LivePlotApp {
-    fn new(args: Args, data: Arc<Mutex<Vec<SeriesBuffer>>>, stream_ended: Arc<AtomicBool>) -> Self {
-        let labels = args.labels.unwrap_or_else(|| vec!["Series 1".to_string()]);
+    fn new(
+        args: Args,
+        data: Arc<Mutex<Vec<SeriesBuffer>>>,
+        stream_ended: Arc<AtomicBool>,
+        labels: Vec<String>,
+    ) -> Self {
         let visible = vec![true; labels.len()];
 
         let legend_corner = match args.legend_pos.to_lowercase().as_str() {
-            "lefttop" => Corner::LeftTop,
-            "righttop" => Corner::RightTop,
-            "leftbottom" => Corner::LeftBottom,
-            "rightbottom" => Corner::RightBottom,
-            _ => Corner::LeftTop,
+            "none" => None,
+            "lefttop" => Some(Corner::LeftTop),
+            "righttop" => Some(Corner::RightTop),
+            "leftbottom" => Some(Corner::LeftBottom),
+            "rightbottom" => Some(Corner::RightBottom),
+            _ => {
+                eprintln!("FATAL ERROR: Invalid --legend-pos '{}'.", args.legend_pos);
+                eprintln!("Accepted values: LeftTop, RightTop, LeftBottom, RightBottom, None");
+                process::exit(1);
+            }
         };
 
         let palette = vec![
@@ -135,33 +148,38 @@ fn format_x_val(x: f64, is_ts: bool) -> String {
 
 impl eframe::App for LivePlotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // --- 1. SIDE PANEL (VISIBILITY CONTROLS) ---
-        egui::SidePanel::right("visibility_panel").show(ctx, |ui| {
+        // --- SIDE PANEL ---
+        egui::SidePanel::right("vis_panel").show(ctx, |ui| {
             ui.vertical_centered(|ui| {
-                ui.heading("Series Visibility");
+                ui.heading("Visibility");
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button("Show All").clicked() {
+                if ui.button("All").clicked() {
                     for v in self.visible.iter_mut() {
                         *v = true;
                     }
                 }
-                if ui.button("Hide All").clicked() {
+                if ui.button("None").clicked() {
                     for v in self.visible.iter_mut() {
                         *v = false;
                     }
                 }
             });
             ui.separator();
-
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for i in 0..self.labels.len() {
                     ui.horizontal(|ui| {
                         let (rect, _) =
                             ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
                         ui.painter().rect_filled(rect, 2.0, self.colors[i]);
-                        ui.selectable_toggle_bool(&mut self.visible[i], &self.labels[i]);
+                        // Fix for E0599: Manual selectable toggle logic
+                        if ui
+                            .selectable_label(self.visible[i], &self.labels[i])
+                            .clicked()
+                        {
+                            self.visible[i] = !self.visible[i];
+                        }
                     });
                 }
             });
@@ -183,7 +201,7 @@ impl eframe::App for LivePlotApp {
             let mut interaction_triggered = false;
             let layer_id = ui.layer_id();
 
-            // --- 2. HEADER ---
+            // --- HEADER ---
             ui.horizontal(|ui| {
                 ui.heading(&self.title);
                 if self.stream_ended.load(Ordering::Relaxed) {
@@ -196,7 +214,7 @@ impl eframe::App for LivePlotApp {
                 let min_z =
                     (self.default_width / (last_x - first_x).max(self.default_width)).max(0.0001);
                 let zx_resp = ui.add_sized(
-                    [(ui.available_width() - 115.0).max(50.0), 20.0],
+                    [(ui.available_width() - 120.0).max(50.0), 20.0],
                     egui::Slider::new(&mut self.x_zoom, min_z..=2000.0)
                         .show_value(false)
                         .logarithmic(true),
@@ -218,7 +236,7 @@ impl eframe::App for LivePlotApp {
                 self.x_center = last_x - (self.default_width / self.x_zoom / 2.0);
             }
 
-            // --- 3. BODY ---
+            // --- BODY (Stretch Layout) ---
             let body_layout =
                 egui::Layout::left_to_right(egui::Align::Min).with_cross_justify(true);
             ui.with_layout(body_layout, |ui| {
@@ -246,8 +264,11 @@ impl eframe::App for LivePlotApp {
                     .x_axis_formatter({
                         let is_ts = self.is_ts_mode;
                         move |m, _| format_x_val(m.value, is_ts)
-                    })
-                    .legend(Legend::default().position(self.legend_corner));
+                    });
+
+                if let Some(pos) = self.legend_corner {
+                    plot = plot.legend(Legend::default().position(pos));
+                }
 
                 for &y in &self.include_y_values {
                     plot = plot.include_y(y);
@@ -258,7 +279,7 @@ impl eframe::App for LivePlotApp {
                 let colors = self.colors.clone();
                 let is_ts = self.is_ts_mode;
                 let include_y = self.include_y_values.clone();
-                let visible = self.visible.clone(); // Snapshot for closure
+                let visible = self.visible.clone();
 
                 let plot_res = plot.show(ui, |plot_ui| {
                     if plot_ui.pointer_coordinate_drag_delta().length() > 0.0
@@ -397,15 +418,30 @@ impl eframe::App for LivePlotApp {
 fn main() {
     let args = Args::parse();
     let is_ts = args.timestamp;
-    let expected = if is_ts {
-        args.labels.as_ref().map_or(1, |l| l.len()) + 1
-    } else {
-        args.labels.as_ref().map_or(1, |l| l.len())
+
+    // Determine label ordering
+    let raw_labels = args
+        .labels
+        .clone()
+        .unwrap_or_else(|| vec!["Series 1".to_string()]);
+    let label_count = raw_labels.len();
+
+    let mut map: Vec<(usize, String)> = raw_labels.into_iter().enumerate().collect();
+    if args.sort_labels {
+        map.sort_by(|a, b| a.1.cmp(&b.1));
+    }
+
+    let display_labels: Vec<String> = map.iter().map(|m| m.1.clone()).collect();
+    let input_to_display_map: Vec<usize> = {
+        let mut inv = vec![0; label_count];
+        for (display_idx, (original_idx, _)) in map.iter().enumerate() {
+            inv[*original_idx] = display_idx;
+        }
+        inv
     };
-    let data_buffer = Arc::new(Mutex::new(vec![
-        Vec::new();
-        expected - if is_ts { 1 } else { 0 }
-    ]));
+
+    let expected = if is_ts { label_count + 1 } else { label_count };
+    let data_buffer = Arc::new(Mutex::new(vec![Vec::new(); label_count]));
     let data_buffer_thread = Arc::clone(&data_buffer);
     let stream_ended = Arc::new(AtomicBool::new(false));
     let stream_ended_thread = Arc::clone(&stream_ended);
@@ -415,7 +451,7 @@ fn main() {
     eframe::run_native(
         "Live Plotter",
         eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default().with_inner_size([1250.0, 750.0]),
+            viewport: egui::ViewportBuilder::default().with_inner_size([1300.0, 800.0]),
             ..Default::default()
         },
         Box::new(move |cc| {
@@ -435,7 +471,7 @@ fn main() {
                             .filter_map(|s| s.parse().ok())
                             .collect();
                         if vals.len() != expected {
-                            eprintln!("FATAL: schema error.");
+                            eprintln!("FATAL ERROR: schema mismatch.");
                             process::exit(1);
                         }
                         let (x, series) = if is_ts {
@@ -445,16 +481,17 @@ fn main() {
                         };
                         {
                             let mut b = data_buffer_thread.lock().unwrap();
-                            for (i, v) in series.into_iter().enumerate() {
-                                if i < b.len() {
-                                    if b[i].len() >= max_pts {
-                                        b[i].remove(0);
+                            for (original_i, v) in series.into_iter().enumerate() {
+                                let display_i = input_to_display_map[original_i];
+                                if display_i < b.len() {
+                                    if b[display_i].len() >= max_pts {
+                                        b[display_i].remove(0);
                                     }
-                                    b[i].push([x, v]);
+                                    b[display_i].push([x, v]);
                                     if is_ts {
-                                        let mut j = b[i].len() - 1;
-                                        while j > 0 && b[i][j][0] < b[i][j - 1][0] {
-                                            b[i].swap(j, j - 1);
+                                        let mut j = b[display_i].len() - 1;
+                                        while j > 0 && b[display_i][j][0] < b[display_i][j - 1][0] {
+                                            b[display_i].swap(j, j - 1);
                                             j -= 1;
                                         }
                                     }
@@ -474,6 +511,7 @@ fn main() {
                 app_args,
                 data_buffer,
                 stream_ended,
+                display_labels,
             )))
         }),
     )
