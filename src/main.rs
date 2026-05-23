@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "High-Performance Live Multi-Series Plotter")]
+#[command(author, version, about = "Zero-Copy High-Performance Live Plotter")]
 struct Args {
     #[arg(short, long, default_value_t = 10000)]
     max_points: usize,
@@ -38,7 +38,7 @@ struct LivePlotApp {
     include_y_values: Vec<f64>,
     labels: Vec<String>,
     colors: Vec<Color32>,
-    visible: Vec<bool>, // Visibility state per series
+    visible: Vec<bool>,
     title: String,
     legend_corner: Corner,
     is_ts_mode: bool,
@@ -62,10 +62,7 @@ impl LivePlotApp {
             "righttop" => Corner::RightTop,
             "leftbottom" => Corner::LeftBottom,
             "rightbottom" => Corner::RightBottom,
-            _ => {
-                eprintln!("FATAL ERROR: Invalid --legend-pos identifier.");
-                process::exit(1);
-            }
+            _ => Corner::LeftTop,
         };
 
         let palette = vec![
@@ -138,26 +135,33 @@ fn format_x_val(x: f64, is_ts: bool) -> String {
 
 impl eframe::App for LivePlotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // --- 1. INTERACTIVE LEGEND PANEL (Right Side) ---
-        egui::SidePanel::right("legend_panel").show(ctx, |ui| {
-            ui.heading("Series Visibility");
+        // --- 1. SIDE PANEL (VISIBILITY CONTROLS) ---
+        egui::SidePanel::right("visibility_panel").show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.heading("Series Visibility");
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.button("Show All").clicked() {
+                    for v in self.visible.iter_mut() {
+                        *v = true;
+                    }
+                }
+                if ui.button("Hide All").clicked() {
+                    for v in self.visible.iter_mut() {
+                        *v = false;
+                    }
+                }
+            });
             ui.separator();
+
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for i in 0..self.labels.len() {
-                    let color = self.colors[i];
                     ui.horizontal(|ui| {
-                        // Color indicator
                         let (rect, _) =
                             ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 2.0, color);
-
-                        // Selectable toggle
-                        if ui
-                            .selectable_label(self.visible[i], &self.labels[i])
-                            .clicked()
-                        {
-                            self.visible[i] = !self.visible[i];
-                        }
+                        ui.painter().rect_filled(rect, 2.0, self.colors[i]);
+                        ui.selectable_toggle_bool(&mut self.visible[i], &self.labels[i]);
                     });
                 }
             });
@@ -192,7 +196,7 @@ impl eframe::App for LivePlotApp {
                 let min_z =
                     (self.default_width / (last_x - first_x).max(self.default_width)).max(0.0001);
                 let zx_resp = ui.add_sized(
-                    [(ui.available_width() - 80.0).max(50.0), 20.0],
+                    [(ui.available_width() - 115.0).max(50.0), 20.0],
                     egui::Slider::new(&mut self.x_zoom, min_z..=2000.0)
                         .show_value(false)
                         .logarithmic(true),
@@ -202,13 +206,10 @@ impl eframe::App for LivePlotApp {
                     interaction_triggered = true;
                 }
 
-                if ui.button("Reset").clicked() {
+                if ui.button("Reset Viewport").clicked() {
                     self.x_zoom = 1.0;
                     self.y_zoom = 1.0;
                     self.auto_follow = true;
-                    for v in self.visible.iter_mut() {
-                        *v = true;
-                    } // Reset visibility
                     interaction_triggered = true;
                 }
             });
@@ -257,7 +258,7 @@ impl eframe::App for LivePlotApp {
                 let colors = self.colors.clone();
                 let is_ts = self.is_ts_mode;
                 let include_y = self.include_y_values.clone();
-                let visible = self.visible.clone(); // Capture visibility snapshot
+                let visible = self.visible.clone(); // Snapshot for closure
 
                 let plot_res = plot.show(ui, |plot_ui| {
                     if plot_ui.pointer_coordinate_drag_delta().length() > 0.0
@@ -274,7 +275,7 @@ impl eframe::App for LivePlotApp {
                         for (i, b) in d.iter().enumerate() {
                             if !visible[i] {
                                 continue;
-                            } // IGNORE HIDDEN for autoscale
+                            }
                             for p in b.iter().filter(|p| p[0] >= x_start) {
                                 min_y = min_y.min(p[1]);
                                 max_y = max_y.max(p[1]);
@@ -320,7 +321,7 @@ impl eframe::App for LivePlotApp {
                     for (i, b) in d.iter().enumerate() {
                         if !visible[i] {
                             continue;
-                        } // SKIP RENDERING HIDDEN
+                        }
                         let slen = b.len();
                         if slen == 0 {
                             continue;
@@ -343,7 +344,6 @@ impl eframe::App for LivePlotApp {
                         );
                     }
 
-                    // Tooltip logic limited to visible only
                     if let Some(mp) = plot_ui.pointer_coordinate() {
                         if let Some(rb) = d.get(0) {
                             let idx = rb
@@ -355,7 +355,7 @@ impl eframe::App for LivePlotApp {
                                 for si in 0..labels.len() {
                                     if !visible[si] {
                                         continue;
-                                    } // IGNORE HIDDEN for tooltips
+                                    }
                                     if let Some(v) = d.get(si).and_then(|b| b.get(i)) {
                                         let dx = v[0] - mp.x;
                                         let dy = (v[1] - mp.y)
@@ -435,7 +435,7 @@ fn main() {
                             .filter_map(|s| s.parse().ok())
                             .collect();
                         if vals.len() != expected {
-                            eprintln!("FATAL ERROR: schema mismatch.");
+                            eprintln!("FATAL: schema error.");
                             process::exit(1);
                         }
                         let (x, series) = if is_ts {
