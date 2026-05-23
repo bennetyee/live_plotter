@@ -1,11 +1,11 @@
 [package]
 name = "live_plotter"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-eframe = "0.28"
-egui_plot = "0.28"
-egui = "0.28"
-clap = { version = "4.4", features = ["derive"] }
-chrono = { version = "0.4", features = ["clock"] } # Added for time formatting
+eframe = "0.29"
+egui = "0.29"
+egui_plot = "0.29"
+clap = { version = "4.0", features = ["derive"] }
+chrono = { version = "0.4", features = ["clock"] }
