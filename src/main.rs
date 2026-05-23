@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "High-Performance Live Plotter")]
+#[command(author, version, about = "High-Performance Live Multi-Series Plotter")]
 struct Args {
     #[arg(short, long, default_value_t = 10000)]
     max_points: usize,
@@ -38,30 +38,32 @@ struct LivePlotApp {
     include_y_values: Vec<f64>,
     labels: Vec<String>,
     colors: Vec<Color32>,
+    visible: Vec<bool>, // Visibility state per series
     title: String,
     legend_corner: Corner,
     is_ts_mode: bool,
-    default_width: f64,
 
-    // Viewport state
+    default_width: f64,
     x_zoom: f64,
     x_center: f64,
     y_zoom: f64,
     y_center: f64,
-    y_nat_h: f64, // Natural height for zoom baseline
+    y_nat_h: f64,
     auto_follow: bool,
 }
 
 impl LivePlotApp {
     fn new(args: Args, data: Arc<Mutex<Vec<SeriesBuffer>>>, stream_ended: Arc<AtomicBool>) -> Self {
         let labels = args.labels.unwrap_or_else(|| vec!["Series 1".to_string()]);
+        let visible = vec![true; labels.len()];
+
         let legend_corner = match args.legend_pos.to_lowercase().as_str() {
             "lefttop" => Corner::LeftTop,
             "righttop" => Corner::RightTop,
             "leftbottom" => Corner::LeftBottom,
             "rightbottom" => Corner::RightBottom,
             _ => {
-                eprintln!("FATAL ERROR: Invalid --legend-pos '{}'.", args.legend_pos);
+                eprintln!("FATAL ERROR: Invalid --legend-pos identifier.");
                 process::exit(1);
             }
         };
@@ -107,6 +109,7 @@ impl LivePlotApp {
             include_y_values: args.include_y,
             labels,
             colors,
+            visible,
             title: args.title,
             legend_corner,
             is_ts_mode: args.timestamp,
@@ -135,6 +138,31 @@ fn format_x_val(x: f64, is_ts: bool) -> String {
 
 impl eframe::App for LivePlotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // --- 1. INTERACTIVE LEGEND PANEL (Right Side) ---
+        egui::SidePanel::right("legend_panel").show(ctx, |ui| {
+            ui.heading("Series Visibility");
+            ui.separator();
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for i in 0..self.labels.len() {
+                    let color = self.colors[i];
+                    ui.horizontal(|ui| {
+                        // Color indicator
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                        ui.painter().rect_filled(rect, 2.0, color);
+
+                        // Selectable toggle
+                        if ui
+                            .selectable_label(self.visible[i], &self.labels[i])
+                            .clicked()
+                        {
+                            self.visible[i] = !self.visible[i];
+                        }
+                    });
+                }
+            });
+        });
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let mut first_x = 0.0;
             let mut last_x = 0.0;
@@ -149,9 +177,9 @@ impl eframe::App for LivePlotApp {
             }
 
             let mut interaction_triggered = false;
-            let layer = ui.layer_id();
+            let layer_id = ui.layer_id();
 
-            // --- 1. HEADER (X-Zoom Slider) ---
+            // --- 2. HEADER ---
             ui.horizontal(|ui| {
                 ui.heading(&self.title);
                 if self.stream_ended.load(Ordering::Relaxed) {
@@ -165,7 +193,7 @@ impl eframe::App for LivePlotApp {
                     (self.default_width / (last_x - first_x).max(self.default_width)).max(0.0001);
                 let zx_resp = ui.add_sized(
                     [(ui.available_width() - 80.0).max(50.0), 20.0],
-                    egui::Slider::new(&mut self.x_zoom, min_z..=1000.0)
+                    egui::Slider::new(&mut self.x_zoom, min_z..=2000.0)
                         .show_value(false)
                         .logarithmic(true),
                 );
@@ -173,10 +201,14 @@ impl eframe::App for LivePlotApp {
                     self.auto_follow = false;
                     interaction_triggered = true;
                 }
+
                 if ui.button("Reset").clicked() {
                     self.x_zoom = 1.0;
                     self.y_zoom = 1.0;
                     self.auto_follow = true;
+                    for v in self.visible.iter_mut() {
+                        *v = true;
+                    } // Reset visibility
                     interaction_triggered = true;
                 }
             });
@@ -185,14 +217,13 @@ impl eframe::App for LivePlotApp {
                 self.x_center = last_x - (self.default_width / self.x_zoom / 2.0);
             }
 
-            // --- 2. BODY (Vertical Slider + Full Height Plot) ---
+            // --- 3. BODY ---
             let body_layout =
                 egui::Layout::left_to_right(egui::Align::Min).with_cross_justify(true);
             ui.with_layout(body_layout, |ui| {
-                // Vertical Y-Zoom Slider
                 let vy_resp = ui.add_sized(
                     [20.0, ui.available_height()],
-                    egui::Slider::new(&mut self.y_zoom, 0.5..=10.0)
+                    egui::Slider::new(&mut self.y_zoom, 0.5..=20.0)
                         .vertical()
                         .show_value(false)
                         .logarithmic(true),
@@ -226,6 +257,7 @@ impl eframe::App for LivePlotApp {
                 let colors = self.colors.clone();
                 let is_ts = self.is_ts_mode;
                 let include_y = self.include_y_values.clone();
+                let visible = self.visible.clone(); // Capture visibility snapshot
 
                 let plot_res = plot.show(ui, |plot_ui| {
                     if plot_ui.pointer_coordinate_drag_delta().length() > 0.0
@@ -239,7 +271,10 @@ impl eframe::App for LivePlotApp {
                         let mut max_y = f64::NEG_INFINITY;
                         let d = data_arc.lock().unwrap();
                         let x_start = last_x - (self.default_width / self.x_zoom);
-                        for b in d.iter() {
+                        for (i, b) in d.iter().enumerate() {
+                            if !visible[i] {
+                                continue;
+                            } // IGNORE HIDDEN for autoscale
                             for p in b.iter().filter(|p| p[0] >= x_start) {
                                 min_y = min_y.min(p[1]);
                                 max_y = max_y.max(p[1]);
@@ -283,6 +318,9 @@ impl eframe::App for LivePlotApp {
 
                     let d = data_arc.lock().unwrap();
                     for (i, b) in d.iter().enumerate() {
+                        if !visible[i] {
+                            continue;
+                        } // SKIP RENDERING HIDDEN
                         let slen = b.len();
                         if slen == 0 {
                             continue;
@@ -305,6 +343,7 @@ impl eframe::App for LivePlotApp {
                         );
                     }
 
+                    // Tooltip logic limited to visible only
                     if let Some(mp) = plot_ui.pointer_coordinate() {
                         if let Some(rb) = d.get(0) {
                             let idx = rb
@@ -314,6 +353,9 @@ impl eframe::App for LivePlotApp {
                             let mut bd = f64::INFINITY;
                             for i in (idx.saturating_sub(1))..(idx + 1).min(rb.len()) {
                                 for si in 0..labels.len() {
+                                    if !visible[si] {
+                                        continue;
+                                    } // IGNORE HIDDEN for tooltips
                                     if let Some(v) = d.get(si).and_then(|b| b.get(i)) {
                                         let dx = v[0] - mp.x;
                                         let dy = (v[1] - mp.y)
@@ -333,7 +375,7 @@ impl eframe::App for LivePlotApp {
                                     let l = labels[si].clone();
                                     egui::show_tooltip_at_pointer(
                                         plot_ui.ctx(),
-                                        layer,
+                                        layer_id,
                                         egui::Id::new("tt"),
                                         |ui: &mut egui::Ui| {
                                             ui.label(format!("{}: {:.4}\nX: {}", l, y, xf));
@@ -373,7 +415,7 @@ fn main() {
     eframe::run_native(
         "Live Plotter",
         eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 750.0]),
+            viewport: egui::ViewportBuilder::default().with_inner_size([1250.0, 750.0]),
             ..Default::default()
         },
         Box::new(move |cc| {
@@ -393,7 +435,7 @@ fn main() {
                             .filter_map(|s| s.parse().ok())
                             .collect();
                         if vals.len() != expected {
-                            eprintln!("FATAL: schema error.");
+                            eprintln!("FATAL ERROR: schema mismatch.");
                             process::exit(1);
                         }
                         let (x, series) = if is_ts {
