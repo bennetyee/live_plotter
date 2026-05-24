@@ -27,10 +27,22 @@ number of sample times and just zoom into the most recent.  After
 zooming, double clicking resets the view to show everything.  A `reset
 view` button resets the display to the default viewport-width wide
 view.  Hovering over a data point shows the data values and the name
-of the time-series to which it belongs.  A visibility panel is
-available on the right so that you can turn individual time-series
-lines off (invisible) and on to get rid of or at least attempt to
-control the clutter.
+of the time-series to which it belongs.
+
+A settings panel is available on the right.  You can collapse it to
+reclaim screen real estate for the data chart.  The top subpanel in
+the settings is a data smoothing subpanel.  The default is no data
+smoothing.  The buttons and slider allow you to set the τ value in the
+exponential smoothing filter.  There is a command line argument to
+control the highest possible τ value on the slider.
+
+See https://en.wikipedia.org/wiki/Exponential_smoothing for more info.
+
+Below the data smoothing subpanel is the visibility subpanel. Using
+it, you can turn individual time-series lines off (invisible) and on
+to get rid of or at least attempt to control the clutter that might be
+hiding the particular time-series data that you're zooming in on /
+exploring.
 
 <img src="screenshot.png">
 
