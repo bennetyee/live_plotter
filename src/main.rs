@@ -10,11 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[derive(Parser, Debug, Clone)]
-#[command(
-    author,
-    version,
-    about = "High-Performance Live Plotter with Exponential Smoothing"
-)]
+#[command(author, version, about = "High-Performance Live Plotter")]
 struct Args {
     #[arg(short, long, default_value_t = 1000000)]
     max_points: usize,
@@ -22,7 +18,6 @@ struct Args {
     viewport_width: f64,
     #[arg(short, long, default_value_t = false)]
     timestamp: bool,
-    /// Fixed period in seconds between samples for non-timestamped data
     #[arg(long, default_value_t = 5.0)]
     sample_period: f64,
     #[arg(long, num_args = 1..)]
@@ -35,11 +30,9 @@ struct Args {
     colors: Option<Vec<String>>,
     #[arg(long, default_value = "Live Time-Series Feed")]
     title: String,
-    /// Legend position: LeftTop, RightTop, LeftBottom, RightBottom, or None
     #[arg(long, default_value = "LeftTop")]
     legend_pos: String,
-    /// Maximum smoothing time constant (tau) in seconds
-    #[arg(long, default_value_t = 3600.0)]
+    #[arg(long, default_value_t = 60.0)]
     max_tau: f64,
 }
 
@@ -58,11 +51,12 @@ struct LivePlotApp {
     legend_corner: Option<Corner>,
     is_ts_mode: bool,
 
-    // UI State
     side_panel_collapsed: bool,
     tau: f64,
     max_tau: f64,
     default_width: f64,
+
+    // Primary Viewport State
     x_zoom: f64,
     x_center: f64,
     y_zoom: f64,
@@ -70,7 +64,6 @@ struct LivePlotApp {
     y_nat_h: f64,
     y_min: f64,
     y_max: f64,
-    scroll_offset: f64,
     auto_follow: bool,
 }
 
@@ -92,7 +85,6 @@ impl LivePlotApp {
             "rightbottom" => Some(Corner::RightBottom),
             _ => {
                 eprintln!("FATAL ERROR: Invalid --legend-pos '{}'.", args.legend_pos);
-                eprintln!("Valid values: LeftTop, RightTop, LeftBottom, RightBottom, None");
                 process::exit(1);
             }
         };
@@ -120,7 +112,6 @@ impl LivePlotApp {
             y_nat_h: 1.0,
             y_min: -1.0,
             y_max: 1.0,
-            scroll_offset: 0.0,
             auto_follow: true,
         }
     }
@@ -205,7 +196,7 @@ fn format_x_val(x: f64, is_ts: bool) -> String {
 
 impl eframe::App for LivePlotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // --- 1. SETTINGS PANEL ---
+        // --- 1. SIDE PANEL ---
         let panel_width = if self.side_panel_collapsed {
             28.0
         } else {
@@ -242,7 +233,6 @@ impl eframe::App for LivePlotApp {
                         ui.heading("Settings");
                     });
                     ui.separator();
-
                     ui.label(egui::RichText::new("Exponential Smoothing").strong());
                     let mut tau_changed = false;
                     ui.horizontal_wrapped(|ui| {
@@ -251,41 +241,41 @@ impl eframe::App for LivePlotApp {
                             tau_changed = true;
                         }
                         if ui
-                            .selectable_label((self.tau - 60.0).abs() < 0.1, "1m")
+                            .selectable_label((self.tau - 1.0).abs() < 0.01, "1s")
                             .clicked()
                         {
-                            self.tau = 60.0;
+                            self.tau = 1.0;
                             tau_changed = true;
                         }
                         if ui
-                            .selectable_label((self.tau - 300.0).abs() < 0.1, "5m")
+                            .selectable_label((self.tau - 5.0).abs() < 0.01, "5s")
                             .clicked()
                         {
-                            self.tau = 300.0;
+                            self.tau = 5.0;
                             tau_changed = true;
                         }
                         if ui
-                            .selectable_label((self.tau - 900.0).abs() < 0.1, "15m")
+                            .selectable_label((self.tau - 15.0).abs() < 0.01, "15s")
                             .clicked()
                         {
-                            self.tau = 900.0;
+                            self.tau = 15.0;
                             tau_changed = true;
                         }
                     });
-                    let slider = ui.add(
-                        egui::Slider::new(&mut self.tau, 0.000001..=self.max_tau)
-                            .show_value(true)
-                            .logarithmic(true)
-                            .text("τ (s)"),
-                    );
-                    if slider.changed() {
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut self.tau, 0.000001..=self.max_tau)
+                                .show_value(true)
+                                .text("τ (s)"),
+                        )
+                        .changed()
+                    {
                         tau_changed = true;
                     }
                     if tau_changed {
                         *self.tau_shared.lock().unwrap() = self.tau;
                         self.recompute_smoothing();
                     }
-
                     ui.add_space(10.0);
                     ui.separator();
                     ui.label(egui::RichText::new("Visibility").strong());
@@ -348,20 +338,19 @@ impl eframe::App for LivePlotApp {
                 }
                 ui.separator();
                 ui.label("X-Zoom:");
-                let cur_x_center = self.x_center;
-                let slider_w = (ui.available_width() - 120.0).max(50.0);
+
                 let min_zx =
                     (self.default_width / (last_x - first_x).max(self.default_width)).max(0.0001);
                 let zx_resp = ui.add_sized(
-                    [slider_w, 20.0],
+                    [(ui.available_width() - 120.0).max(50.0), 20.0],
                     egui::Slider::new(&mut self.x_zoom, min_zx..=2000.0)
                         .show_value(false)
                         .logarithmic(true),
                 );
+
                 if zx_resp.changed() {
                     self.auto_follow = false;
                     trigger = true;
-                    self.scroll_offset = cur_x_center - (self.default_width / self.x_zoom / 2.0);
                 }
                 if ui.button("Reset Viewport").clicked() {
                     self.x_zoom = 1.0;
@@ -370,10 +359,6 @@ impl eframe::App for LivePlotApp {
                     trigger = true;
                 }
             });
-
-            if self.auto_follow {
-                self.scroll_offset = (last_x - (self.default_width / self.x_zoom)).max(first_x);
-            }
 
             let body_layout =
                 egui::Layout::left_to_right(egui::Align::Min).with_cross_justify(true);
@@ -432,10 +417,11 @@ impl eframe::App for LivePlotApp {
                     }
 
                     if self.auto_follow {
+                        let width = def_w / self.x_zoom;
+                        let x_start = last_x - width;
                         let mut min_y_vis = f64::INFINITY;
                         let mut max_y_vis = f64::NEG_INFINITY;
                         let d = data_arc.lock().unwrap();
-                        let x_start = last_x - (def_w / self.x_zoom);
                         for (i, b) in d.iter().enumerate() {
                             if !visible[i] {
                                 continue;
@@ -460,30 +446,28 @@ impl eframe::App for LivePlotApp {
                         self.y_zoom = 1.0;
                         self.y_min = base.0;
                         self.y_max = base.1;
-                        self.x_center = last_x - (def_w / self.x_zoom / 2.0);
-                        self.scroll_offset = x_start;
+                        self.x_center = last_x - (width / 2.0);
                         plot_ui.set_plot_bounds(PlotBounds::from_min_max(
                             [x_start, base.0],
                             [last_x, base.1],
                         ));
                     } else if trigger {
+                        let hw = (def_w / self.x_zoom) / 2.0;
                         let hh = (self.y_nat_h / self.y_zoom) / 2.0;
                         let f_y_min = cur_y_center - hh;
                         let f_y_max = cur_y_center + hh;
                         plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                            [self.scroll_offset, f_y_min],
-                            [self.scroll_offset + (def_w / self.x_zoom), f_y_max],
+                            [self.x_center - hw, f_y_min],
+                            [self.x_center + hw, f_y_max],
                         ));
                         self.y_min = f_y_min;
                         self.y_max = f_y_max;
-                        self.y_zoom = 1.0;
                     } else {
                         let b = plot_ui.plot_bounds();
                         self.x_center = b.center().x;
                         self.y_center = b.center().y;
                         self.y_min = b.min()[1];
                         self.y_max = b.max()[1];
-                        self.scroll_offset = b.min()[0];
                         if b.width() > 0.0 {
                             self.x_zoom = def_w / b.width();
                         }
@@ -578,7 +562,6 @@ fn main() {
         .clone()
         .unwrap_or_else(|| vec!["Series 1".to_string()]);
     let label_count = raw_labels.len();
-
     let mut map: Vec<(usize, String)> = raw_labels.into_iter().enumerate().collect();
     if args.sort_labels {
         map.sort_by(|a, b| a.1.cmp(&b.1));
@@ -604,16 +587,16 @@ fn main() {
     let stream_ended = Arc::new(AtomicBool::new(false));
     let stream_ended_thread = Arc::clone(&stream_ended);
     let max_pts = args.max_points;
+    let app_args = args.clone();
 
     eframe::run_native(
         "Live Plotter",
         eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 850.0]),
+            viewport: egui::ViewportBuilder::default().with_inner_size([1300.0, 800.0]),
             ..Default::default()
         },
         Box::new(move |cc| {
             let ctx = cc.egui_ctx.clone();
-            let app_args = args.clone();
             thread::spawn(move || {
                 let stdin = io::stdin();
                 let mut seq = 0;
@@ -629,7 +612,7 @@ fn main() {
                             .filter_map(|s| s.parse().ok())
                             .collect();
                         if vals.len() != expected {
-                            eprintln!("FATAL: schema mismatch.");
+                            eprintln!("FATAL: schema error.");
                             process::exit(1);
                         }
                         let (x, series) = if is_ts {
