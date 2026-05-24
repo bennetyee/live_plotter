@@ -7,14 +7,14 @@ by the lie detectors that you see in the movies.
 This is like those.
 
 An external program generates/provides the time-series data values to
-be plotted with `live_plotter`.  The measurement values are real
-numbers, and all the values must be present, separated by a space, on
-a single line for each time step.  Labels should be specified for each
-of the time-series data, and the number of labels must match the
-number of numbers per line of input.  If the `--timestamp` command
-line argument is specified, then the number of numbers should be one
-greater, with the first number representing the timestamp value in
-seconds since the Unix epoch.
+be plotted with `live_plotter`.  The measurement values are either
+"none" or a real numbers, and all the time-series values must be
+present, separated by a space, on a single line for each time step.
+Labels should be specified for each of the time-series data, and the
+number of labels must match the number of numbers per line of input.
+If the `--timestamp` command line argument is specified, then the
+number of numbers should be one greater, with the first number
+representing the timestamp value in seconds since the Unix epoch.
 
 Unlike real strip charts with paper tape made for Turing machines, the
 display area is finite, and the `--viewport-width` command line
@@ -46,24 +46,6 @@ exploring.
 
 <img src="screenshot.png">
 
-## Disclaimer
-
-The code in this repo is entirely vibe coded using
-http://aistudio.google.com/.  The only manual thing done other than
-cutting-and-pasting the AI Studio generated code into the repository
-is occasionally remembering to run `rustfmt`; the Studio generated
-code sometimes has extraneous trailing spaces and the like.
-
-There appears to be an issue with one or more of `eframe`, `egui`, and
-`egui_plot` where even though no data is updating and you are not
-clicking and dragging the chart, by just moving the mouse over the
-chart area, you can get the program to spin and chew up most of a CPU
-core.  As of this writing, AI Studio doesn't seem to understand how to
-use a more recent version of these graphical UI packages than 0.29
-(the API isn't stable), and I haven't tried to figure out of the
-latest 0.34 version of these packages still have this performance
-issue.
-
 ## Usage
 
 ```
@@ -71,3 +53,28 @@ $ span_circuit_info  -a --abs -k instantPowerW --live 5 --timestamp | eval live_
 ```
 
 See https://github.com/bennetyee/span_circuit_info for `span_circuit_info`.
+
+## BUGS
+
+The exponential smoothing for the data "works" when there's missing
+data points, but the display is not smoothed (data points are
+connected by straight lines).  This is probably not the right thing to
+do.
+
+There appears to be an issue with one or more of `eframe`, `egui`, and
+`egui_plot` where even though no data is updating and you are not
+"actively" interacting with the plot by clicking and dragging the
+chart, you can get the program to spin and chew up most of a CPU core
+by just wiggling the mouse over the chart area.  As of this writing,
+AI Studio doesn't seem to understand how to use a more recent version
+of these graphical UI packages than 0.29 (the API isn't stable), and I
+haven't tried to figure out of the latest 0.34 version of these
+packages still have this performance issue.
+
+## Disclaimer
+
+The code in this repo is entirely vibe coded using
+http://aistudio.google.com/.  The only manual thing done other than
+cutting-and-pasting the AI Studio generated code into the repository
+is occasionally remembering to run `rustfmt`; the Studio generated
+code sometimes has extraneous trailing spaces and the like.

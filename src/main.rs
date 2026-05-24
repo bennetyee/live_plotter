@@ -10,7 +10,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "High-Performance Live Plotter")]
+#[command(
+    author,
+    version,
+    about = "High-Performance Live Plotter with Missing Data Support"
+)]
 struct Args {
     #[arg(short, long, default_value_t = 1000000)]
     max_points: usize,
@@ -18,6 +22,7 @@ struct Args {
     viewport_width: f64,
     #[arg(short, long, default_value_t = false)]
     timestamp: bool,
+    /// Fixed period in seconds between samples for non-timestamped data
     #[arg(long, default_value_t = 5.0)]
     sample_period: f64,
     #[arg(long, num_args = 1..)]
@@ -30,8 +35,10 @@ struct Args {
     colors: Option<Vec<String>>,
     #[arg(long, default_value = "Live Time-Series Feed")]
     title: String,
+    /// Legend position: LeftTop, RightTop, LeftBottom, RightBottom, or None
     #[arg(long, default_value = "LeftTop")]
     legend_pos: String,
+    /// Maximum smoothing time constant (tau) in seconds
     #[arg(long, default_value_t = 60.0)]
     max_tau: f64,
 }
@@ -51,12 +58,11 @@ struct LivePlotApp {
     legend_corner: Option<Corner>,
     is_ts_mode: bool,
 
+    // UI State
     side_panel_collapsed: bool,
     tau: f64,
     max_tau: f64,
     default_width: f64,
-
-    // Primary Viewport State
     x_zoom: f64,
     x_center: f64,
     y_zoom: f64,
@@ -64,6 +70,7 @@ struct LivePlotApp {
     y_nat_h: f64,
     y_min: f64,
     y_max: f64,
+    scroll_offset: f64,
     auto_follow: bool,
 }
 
@@ -112,6 +119,7 @@ impl LivePlotApp {
             y_nat_h: 1.0,
             y_min: -1.0,
             y_max: 1.0,
+            scroll_offset: 0.0,
             auto_follow: true,
         }
     }
@@ -196,7 +204,7 @@ fn format_x_val(x: f64, is_ts: bool) -> String {
 
 impl eframe::App for LivePlotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // --- 1. SIDE PANEL ---
+        // --- 1. SETTINGS PANEL ---
         let panel_width = if self.side_panel_collapsed {
             28.0
         } else {
@@ -233,6 +241,7 @@ impl eframe::App for LivePlotApp {
                         ui.heading("Settings");
                     });
                     ui.separator();
+
                     ui.label(egui::RichText::new("Exponential Smoothing").strong());
                     let mut tau_changed = false;
                     ui.horizontal_wrapped(|ui| {
@@ -276,6 +285,7 @@ impl eframe::App for LivePlotApp {
                         *self.tau_shared.lock().unwrap() = self.tau;
                         self.recompute_smoothing();
                     }
+
                     ui.add_space(10.0);
                     ui.separator();
                     ui.label(egui::RichText::new("Visibility").strong());
@@ -318,10 +328,17 @@ impl eframe::App for LivePlotApp {
             let mut last_x = 0.0;
             {
                 let d = self.raw_data.lock().unwrap();
-                if let Some(b) = d.get(0) {
-                    if let (Some(f), Some(l)) = (b.first(), b.last()) {
-                        first_x = f[0];
-                        last_x = l[0];
+                // Find global min/max X across all potentially sparse series
+                let mut found = false;
+                for buf in d.iter() {
+                    if let (Some(f), Some(l)) = (buf.first(), buf.last()) {
+                        if !found || f[0] < first_x {
+                            first_x = f[0];
+                        }
+                        if !found || l[0] > last_x {
+                            last_x = l[0];
+                        }
+                        found = true;
                     }
                 }
             }
@@ -338,19 +355,22 @@ impl eframe::App for LivePlotApp {
                 }
                 ui.separator();
                 ui.label("X-Zoom:");
-
+                let cur_x_center = self.x_center;
+                let slider_w = (ui.available_width() - 115.0).max(50.0);
                 let min_zx =
                     (self.default_width / (last_x - first_x).max(self.default_width)).max(0.0001);
-                let zx_resp = ui.add_sized(
-                    [(ui.available_width() - 120.0).max(50.0), 20.0],
-                    egui::Slider::new(&mut self.x_zoom, min_zx..=2000.0)
-                        .show_value(false)
-                        .logarithmic(true),
-                );
-
-                if zx_resp.changed() {
+                if ui
+                    .add_sized(
+                        [slider_w, 20.0],
+                        egui::Slider::new(&mut self.x_zoom, min_zx..=1000.0)
+                            .show_value(false)
+                            .logarithmic(true),
+                    )
+                    .changed()
+                {
                     self.auto_follow = false;
                     trigger = true;
+                    self.scroll_offset = cur_x_center - (self.default_width / self.x_zoom / 2.0);
                 }
                 if ui.button("Reset Viewport").clicked() {
                     self.x_zoom = 1.0;
@@ -359,6 +379,10 @@ impl eframe::App for LivePlotApp {
                     trigger = true;
                 }
             });
+
+            if self.auto_follow {
+                self.scroll_offset = (last_x - (self.default_width / self.x_zoom)).max(first_x);
+            }
 
             let body_layout =
                 egui::Layout::left_to_right(egui::Align::Min).with_cross_justify(true);
@@ -447,27 +471,29 @@ impl eframe::App for LivePlotApp {
                         self.y_min = base.0;
                         self.y_max = base.1;
                         self.x_center = last_x - (width / 2.0);
+                        self.scroll_offset = x_start;
                         plot_ui.set_plot_bounds(PlotBounds::from_min_max(
                             [x_start, base.0],
                             [last_x, base.1],
                         ));
                     } else if trigger {
-                        let hw = (def_w / self.x_zoom) / 2.0;
                         let hh = (self.y_nat_h / self.y_zoom) / 2.0;
                         let f_y_min = cur_y_center - hh;
                         let f_y_max = cur_y_center + hh;
                         plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                            [self.x_center - hw, f_y_min],
-                            [self.x_center + hw, f_y_max],
+                            [self.scroll_offset, f_y_min],
+                            [self.scroll_offset + (def_w / self.x_zoom), f_y_max],
                         ));
                         self.y_min = f_y_min;
                         self.y_max = f_y_max;
+                        self.y_zoom = 1.0;
                     } else {
                         let b = plot_ui.plot_bounds();
                         self.x_center = b.center().x;
                         self.y_center = b.center().y;
                         self.y_min = b.min()[1];
                         self.y_max = b.max()[1];
+                        self.scroll_offset = b.min()[0];
                         if b.width() > 0.0 {
                             self.x_zoom = def_w / b.width();
                         }
@@ -562,6 +588,7 @@ fn main() {
         .clone()
         .unwrap_or_else(|| vec!["Series 1".to_string()]);
     let label_count = raw_labels.len();
+
     let mut map: Vec<(usize, String)> = raw_labels.into_iter().enumerate().collect();
     if args.sort_labels {
         map.sort_by(|a, b| a.1.cmp(&b.1));
@@ -592,7 +619,7 @@ fn main() {
     eframe::run_native(
         "Live Plotter",
         eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default().with_inner_size([1300.0, 800.0]),
+            viewport: egui::ViewportBuilder::default().with_inner_size([1500.0, 850.0]),
             ..Default::default()
         },
         Box::new(move |cc| {
@@ -606,42 +633,61 @@ fn main() {
                         if trimmed.is_empty() {
                             continue;
                         }
-                        let vals: Vec<f64> = trimmed
+                        let tokens: Vec<&str> = trimmed
                             .split(|c| c == ',' || c == ' ')
                             .filter(|s| !s.is_empty())
-                            .filter_map(|s| s.parse().ok())
                             .collect();
-                        if vals.len() != expected {
-                            eprintln!("FATAL: schema error.");
+                        if tokens.len() != expected {
+                            eprintln!(
+                                "FATAL: expected {} columns, found {}.",
+                                expected,
+                                tokens.len()
+                            );
                             process::exit(1);
                         }
-                        let (x, series) = if is_ts {
-                            (vals[0], vals[1..].to_vec())
+
+                        let (x, data_tokens) = if is_ts {
+                            (
+                                tokens[0].parse::<f64>().expect("Time col 0 must be float"),
+                                &tokens[1..],
+                            )
                         } else {
-                            (seq as f64 * period, vals)
+                            (seq as f64 * period, &tokens[..])
                         };
+
                         {
                             let mut rb = raw_thread.lock().unwrap();
                             let mut sb = smooth_thread.lock().unwrap();
                             let t = *tau_thread.lock().unwrap();
-                            for (original_i, v) in series.into_iter().enumerate() {
-                                let i = input_to_display_map[original_i];
-                                if i < rb.len() {
-                                    if rb[i].len() >= max_pts {
-                                        rb[i].remove(0);
+                            for (original_i, token) in data_tokens.iter().enumerate() {
+                                let display_i = input_to_display_map[original_i];
+                                let clean = token.to_lowercase();
+
+                                // Handling None / null
+                                if clean == "none" || clean == "null" {
+                                    continue;
+                                }
+
+                                if let Ok(v) = token.parse::<f64>() {
+                                    // RAW update
+                                    if rb[display_i].len() >= max_pts {
+                                        rb[display_i].remove(0);
                                     }
-                                    rb[i].push([x, v]);
+                                    rb[display_i].push([x, v]);
                                     if is_ts {
-                                        let mut j = rb[i].len() - 1;
-                                        while j > 0 && rb[i][j][0] < rb[i][j - 1][0] {
-                                            rb[i].swap(j, j - 1);
+                                        let mut j = rb[display_i].len() - 1;
+                                        while j > 0 && rb[display_i][j][0] < rb[display_i][j - 1][0]
+                                        {
+                                            rb[display_i].swap(j, j - 1);
                                             j -= 1;
                                         }
                                     }
-                                    if sb[i].len() >= max_pts {
-                                        sb[i].remove(0);
+
+                                    // SMOOTHED update
+                                    if sb[display_i].len() >= max_pts {
+                                        sb[display_i].remove(0);
                                     }
-                                    let y = if let Some(last) = sb[i].last() {
+                                    let y = if let Some(last) = sb[display_i].last() {
                                         let dt = (x - last[0]).max(0.0);
                                         if t <= 1e-6 {
                                             v
@@ -652,7 +698,7 @@ fn main() {
                                     } else {
                                         v
                                     };
-                                    sb[i].push([x, y]);
+                                    sb[display_i].push([x, y]);
                                 }
                             }
                             seq += 1;
