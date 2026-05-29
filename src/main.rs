@@ -29,7 +29,6 @@ struct Args {
     colors: Option<Vec<String>>,
     #[arg(long, default_value = "Live Time-Series Feed")]
     title: String,
-    /// Legend position: LeftTop, RightTop, LeftBottom, RightBottom, or None
     #[arg(long, default_value = "LeftTop")]
     legend_pos: String,
     #[arg(long, default_value_t = 60.0)]
@@ -83,7 +82,6 @@ impl LivePlotApp {
             "rightbottom" => Some(Corner::RightBottom),
             _ => {
                 eprintln!("FATAL ERROR: Invalid --legend-pos '{}'.", args.legend_pos);
-                eprintln!("Valid values: LeftTop, RightTop, LeftBottom, RightBottom, None");
                 std::process::exit(1);
             }
         };
@@ -193,7 +191,7 @@ fn format_x_val(x: f64, is_ts: bool) -> String {
 
 impl eframe::App for LivePlotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // --- 1. SIDE PANEL ---
+        // --- 1. SETTINGS PANEL ---
         let panel_width = if self.side_panel_collapsed {
             28.0
         } else {
@@ -309,7 +307,7 @@ impl eframe::App for LivePlotApp {
                 }
             });
 
-        // --- 2. CENTRAL PANEL (PLOT) ---
+        // --- 2. CENTRAL PANEL ---
         egui::CentralPanel::default().show(ctx, |ui| {
             let mut first_x = 0.0;
             let mut last_x = 0.0;
@@ -329,16 +327,45 @@ impl eframe::App for LivePlotApp {
                 }
             }
 
-            let mut trigger = false;
+            let mut interaction_triggered = false;
             let layer_id = ui.layer_id();
 
+            // HEADER
             ui.horizontal(|ui| {
                 ui.heading(&self.title);
-                if self.stream_ended.load(Ordering::Relaxed) {
-                    ui.colored_label(Color32::GOLD, "⚠️ Ended");
-                } else if self.auto_follow {
-                    ui.colored_label(Color32::from_rgb(100, 200, 255), "• LIVE");
-                }
+
+                // --- CALCULATION OF FIXED WIDTH STATUS AREA ---
+                let font_id = TextStyle::Body.resolve(ui.style());
+                let max_status_w = ui.fonts(|f| {
+                    let w1 = f
+                        .layout_no_wrap("• LIVE".into(), font_id.clone(), Color32::WHITE)
+                        .rect
+                        .width();
+                    let w2 = f
+                        .layout_no_wrap("EXPLORE".into(), font_id.clone(), Color32::WHITE)
+                        .rect
+                        .width();
+                    let w3 = f
+                        .layout_no_wrap("⚠️ Ended".into(), font_id.clone(), Color32::WHITE)
+                        .rect
+                        .width();
+                    w1.max(w2).max(w3)
+                });
+
+                // Allocate fixed-size area. We add a few pixels of margin.
+                ui.add_sized([max_status_w + 10.0, 20.0], |ui: &mut egui::Ui| {
+                    ui.centered_and_justified(|ui| {
+                        if self.stream_ended.load(Ordering::Relaxed) {
+                            ui.colored_label(Color32::GOLD, "⚠️ Ended")
+                        } else if self.auto_follow {
+                            ui.colored_label(Color32::from_rgb(100, 200, 255), "• LIVE")
+                        } else {
+                            ui.weak("EXPLORE")
+                        }
+                    })
+                    .response
+                });
+
                 ui.separator();
                 ui.label("X-Zoom:");
                 let cur_x_center = self.x_center;
@@ -353,14 +380,14 @@ impl eframe::App for LivePlotApp {
                 );
                 if zx_resp.changed() {
                     self.auto_follow = false;
-                    trigger = true;
-                    self.x_center = cur_x_center;
+                    interaction_triggered = true;
+                    self.x_center = cur_x_center; // Anchor expansion to visual center
                 }
                 if ui.button("Reset Viewport").clicked() {
                     self.x_zoom = 1.0;
                     self.y_zoom = 1.0;
                     self.auto_follow = true;
-                    trigger = true;
+                    interaction_triggered = true;
                 }
             });
 
@@ -385,11 +412,12 @@ impl eframe::App for LivePlotApp {
                     .changed()
                 {
                     self.auto_follow = false;
-                    trigger = true;
+                    interaction_triggered = true;
                 }
 
+                let plot_height = ui.available_height() - 4.0;
                 let mut plot = Plot::new("lp")
-                    .height(ui.available_height())
+                    .height(plot_height)
                     .width(ui.available_width())
                     .auto_bounds([false, false].into())
                     .allow_zoom(true)
@@ -408,7 +436,7 @@ impl eframe::App for LivePlotApp {
                         let major_step = steps
                             .iter()
                             .copied()
-                            .find(|&s| span / s >= 4.0)
+                            .find(|&s| span / s >= 5.0)
                             .unwrap_or(1.0);
                         let minor_step = major_step / 4.0;
                         let sample_ts = input.bounds.0 as i64;
@@ -448,7 +476,6 @@ impl eframe::App for LivePlotApp {
                                 if span > 86400.0 {
                                     local_dt.format("%m/%d %H:%M").to_string()
                                 } else if mark.step_size >= 60.0 {
-                                    // Requirement: Omit seconds if interval >= 1 minute
                                     local_dt.format("%H:%M").to_string()
                                 } else {
                                     local_dt.format("%H:%M:%S").to_string()
@@ -485,7 +512,7 @@ impl eframe::App for LivePlotApp {
                     {
                         self.auto_follow = false;
                     }
-                    let bounds = plot_ui.plot_bounds();
+                    let b = plot_ui.plot_bounds();
 
                     if self.auto_follow {
                         let width = def_w / self.x_zoom;
@@ -523,7 +550,7 @@ impl eframe::App for LivePlotApp {
                             [x_start, base.0],
                             [last_x, base.1],
                         ));
-                    } else if trigger {
+                    } else if interaction_triggered {
                         let hh = (self.y_nat_h / self.y_zoom) / 2.0;
                         let hw = (def_w / self.x_zoom) / 2.0;
                         let f_y_min = cur_y_center - hh;
@@ -536,16 +563,16 @@ impl eframe::App for LivePlotApp {
                         self.y_max = f_y_max;
                         self.scroll_offset = self.x_center - hw;
                     } else {
-                        self.x_center = bounds.center().x;
-                        self.y_center = bounds.center().y;
-                        self.y_min = bounds.min()[1];
-                        self.y_max = bounds.max()[1];
-                        self.scroll_offset = bounds.min()[0];
-                        if bounds.width() > 0.0 {
-                            self.x_zoom = def_w / bounds.width();
+                        self.x_center = b.center().x;
+                        self.y_center = b.center().y;
+                        self.y_min = b.min()[1];
+                        self.y_max = b.max()[1];
+                        self.scroll_offset = b.min()[0];
+                        if b.width() > 0.0 {
+                            self.x_zoom = def_w / b.width();
                         }
-                        if bounds.height() > 0.0 {
-                            self.y_zoom = (self.y_nat_h / bounds.height()).max(0.001);
+                        if b.height() > 0.0 {
+                            self.y_zoom = (self.y_nat_h / b.height()).max(0.001);
                         }
                     }
 
@@ -618,7 +645,7 @@ impl eframe::App for LivePlotApp {
                         }
                     }
                 });
-                if trigger || plot_res.response.dragged() {
+                if interaction_triggered || plot_res.response.dragged() {
                     ui.ctx().request_repaint();
                 }
             });
@@ -647,7 +674,6 @@ fn main() {
         }
         inv
     };
-
     let expected = if is_ts { label_count + 1 } else { label_count };
     let raw_buffer: Arc<Mutex<Vec<SeriesBuffer>>> =
         Arc::new(Mutex::new(vec![Vec::new(); label_count]));
@@ -661,7 +687,6 @@ fn main() {
     let stream_ended_thread = Arc::clone(&stream_ended);
     let max_pts = args.max_points;
     let app_args = args.clone();
-
     eframe::run_native(
         "Live Plotter",
         eframe::NativeOptions {
@@ -689,7 +714,7 @@ fn main() {
                         }
                         let (x, data_tokens) = if is_ts {
                             (
-                                tokens[0].parse::<f64>().expect("Time col 0 must be float"),
+                                tokens[0].parse::<f64>().expect("Time col must be float"),
                                 &tokens[1..],
                             )
                         } else {
