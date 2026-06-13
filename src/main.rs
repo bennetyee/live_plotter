@@ -9,34 +9,61 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "High-Performance Live Plotter")]
+#[command(author, version, about = "High-Performance Live Multi-Series Plotter")]
 struct Args {
+    /// Maximum number of data points to display in the total buffer per series
     #[arg(short, long, default_value_t = 1000000)]
     max_points: usize,
+
+    /// Initial number of X-axis units visible in the viewport
     #[arg(short, long, default_value_t = 500.0)]
     viewport_width: f64,
+
+    /// Interpret the first column as a Unix timestamp (seconds since epoch)
     #[arg(short, long, default_value_t = false)]
     timestamp: bool,
+
+    /// Fixed period in seconds between samples for non-timestamped data
     #[arg(long, default_value_t = 5.0)]
     sample_period: f64,
+
+    /// Y-axis values that should always be visible (baseline/ceiling)
     #[arg(long, num_args = 1..)]
     include_y: Vec<f64>,
+
+    /// Labels for the data series
     #[arg(short, long, num_args = 1..)]
     labels: Option<Vec<String>>,
+
+    /// Sort labels alphabetically (default is command-line order)
     #[arg(long, default_value_t = false)]
     sort_labels: bool,
+
+    /// Hex colors for the lines (e.g., #ff0000 #00ff00)
     #[arg(short, long, num_args = 1..)]
     colors: Option<Vec<String>>,
+
+    /// The title displayed at the top of the graph (Long form only)
     #[arg(long, default_value = "Live Time-Series Feed")]
     title: String,
+
     /// Legend position: LeftTop, RightTop, LeftBottom, RightBottom, or None
     #[arg(long, default_value = "LeftTop")]
     legend_pos: String,
+
+    /// Maximum smoothing time constant (tau) in seconds
     #[arg(long, default_value_t = 60.0)]
     max_tau: f64,
 }
 
 type SeriesBuffer = Vec<[f64; 2]>;
+
+#[derive(PartialEq, Clone, Copy)]
+enum ZoomAnchor {
+    Left,
+    Center,
+    Right,
+}
 
 struct LivePlotApp {
     raw_data: Arc<Mutex<Vec<SeriesBuffer>>>,
@@ -50,19 +77,22 @@ struct LivePlotApp {
     title: String,
     legend_corner: Option<Corner>,
     is_ts_mode: bool,
+
+    // UI State
     side_panel_collapsed: bool,
     tau: f64,
     max_tau: f64,
     default_width: f64,
+
+    // Viewport State
     x_zoom: f64,
-    x_center: f64,
+    scroll_offset: f64, // Left edge of the viewport
     y_zoom: f64,
-    y_center: f64,
-    y_nat_h: f64,
     y_min: f64,
     y_max: f64,
-    scroll_offset: f64,
+    y_nat_h: f64,
     auto_follow: bool,
+    anchor: ZoomAnchor,
 }
 
 impl LivePlotApp {
@@ -83,7 +113,7 @@ impl LivePlotApp {
             "rightbottom" => Some(Corner::RightBottom),
             _ => {
                 eprintln!("FATAL ERROR: Invalid --legend-pos '{}'.", args.legend_pos);
-                eprintln!("Valid values: LeftTop, RightTop, LeftBottom, RightBottom, None");
+                eprintln!("Valid values are: LeftTop, RightTop, LeftBottom, RightBottom, None");
                 std::process::exit(1);
             }
         };
@@ -105,14 +135,13 @@ impl LivePlotApp {
             max_tau: args.max_tau,
             default_width: args.viewport_width,
             x_zoom: 1.0,
-            x_center: 0.0,
+            scroll_offset: 0.0,
             y_zoom: 1.0,
-            y_center: 0.0,
-            y_nat_h: 1.0,
             y_min: -1.0,
             y_max: 1.0,
-            scroll_offset: 0.0,
+            y_nat_h: 1.0,
             auto_follow: true,
+            anchor: ZoomAnchor::Center,
         }
     }
 
@@ -193,7 +222,7 @@ fn format_x_val(x: f64, is_ts: bool) -> String {
 
 impl eframe::App for LivePlotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // --- 1. SIDE PANEL ---
+        // --- 1. SETTINGS PANEL ---
         let panel_width = if self.side_panel_collapsed {
             28.0
         } else {
@@ -309,7 +338,7 @@ impl eframe::App for LivePlotApp {
                 }
             });
 
-        // --- 2. CENTRAL PANEL (PLOT) ---
+        // --- 2. CENTRAL PANEL ---
         egui::CentralPanel::default().show(ctx, |ui| {
             let mut first_x = 0.0;
             let mut last_x = 0.0;
@@ -332,16 +361,60 @@ impl eframe::App for LivePlotApp {
             let mut trigger = false;
             let layer_id = ui.layer_id();
 
+            // HEADER
             ui.horizontal(|ui| {
                 ui.heading(&self.title);
-                if self.stream_ended.load(Ordering::Relaxed) {
-                    ui.colored_label(Color32::GOLD, "⚠️ Ended");
-                } else if self.auto_follow {
-                    ui.colored_label(Color32::from_rgb(100, 200, 255), "• LIVE");
-                }
+
+                // FIXED WIDTH STATUS AREA
+                let font_id = TextStyle::Body.resolve(ui.style());
+                let max_status_w = ui.fonts(|f| {
+                    let w1 = f
+                        .layout_no_wrap("• LIVE".into(), font_id.clone(), Color32::WHITE)
+                        .rect
+                        .width();
+                    let w2 = f
+                        .layout_no_wrap("EXPLORE".into(), font_id.clone(), Color32::WHITE)
+                        .rect
+                        .width();
+                    let w3 = f
+                        .layout_no_wrap("⚠️ Ended".into(), font_id.clone(), Color32::WHITE)
+                        .rect
+                        .width();
+                    w1.max(w2).max(w3)
+                });
+
+                ui.add_sized([max_status_w + 10.0, 20.0], |ui: &mut egui::Ui| {
+                    ui.centered_and_justified(|ui| {
+                        if self.stream_ended.load(Ordering::Relaxed) {
+                            ui.colored_label(Color32::GOLD, "⚠️ Ended")
+                        } else if self.auto_follow {
+                            ui.colored_label(Color32::from_rgb(100, 200, 255), "• LIVE")
+                        } else {
+                            ui.weak("EXPLORE")
+                        }
+                    })
+                    .response
+                });
+
+                ui.separator();
+
+                // --- ZOOM ANCHOR SELECTOR ---
+                ui.label("Anchor:");
+                ui.selectable_value(&mut self.anchor, ZoomAnchor::Left, "L");
+                ui.selectable_value(&mut self.anchor, ZoomAnchor::Center, "C");
+                ui.selectable_value(&mut self.anchor, ZoomAnchor::Right, "R");
+
                 ui.separator();
                 ui.label("X-Zoom:");
-                let cur_x_center = self.x_center;
+
+                // Before slider changes, calculate current width and anchor point
+                let old_width = self.default_width / self.x_zoom;
+                let anchor_x = match self.anchor {
+                    ZoomAnchor::Left => self.scroll_offset,
+                    ZoomAnchor::Center => self.scroll_offset + (old_width / 2.0),
+                    ZoomAnchor::Right => self.scroll_offset + old_width,
+                };
+
                 let slider_w = (ui.available_width() - 115.0).max(50.0);
                 let min_zx =
                     (self.default_width / (last_x - first_x).max(self.default_width)).max(0.0001);
@@ -351,11 +424,19 @@ impl eframe::App for LivePlotApp {
                         .show_value(false)
                         .logarithmic(true),
                 );
+
                 if zx_resp.changed() {
                     self.auto_follow = false;
                     trigger = true;
-                    self.x_center = cur_x_center;
+                    // Recalculate scroll_offset to keep anchor_x fixed
+                    let new_width = self.default_width / self.x_zoom;
+                    self.scroll_offset = match self.anchor {
+                        ZoomAnchor::Left => anchor_x,
+                        ZoomAnchor::Center => anchor_x - (new_width / 2.0),
+                        ZoomAnchor::Right => anchor_x - new_width,
+                    };
                 }
+
                 if ui.button("Reset Viewport").clicked() {
                     self.x_zoom = 1.0;
                     self.y_zoom = 1.0;
@@ -389,7 +470,7 @@ impl eframe::App for LivePlotApp {
                 }
 
                 let mut plot = Plot::new("lp")
-                    .height(ui.available_height())
+                    .height(ui.available_height() - 4.0)
                     .width(ui.available_width())
                     .auto_bounds([false, false].into())
                     .allow_zoom(true)
@@ -434,7 +515,6 @@ impl eframe::App for LivePlotApp {
                     });
 
                     plot = plot.x_axis_formatter(move |mark, range| {
-                        let span = *range.end() - *range.start();
                         let local_offset =
                             if let Some(dt) = DateTime::from_timestamp(mark.value as i64, 0) {
                                 dt.with_timezone(&Local).offset().fix().local_minus_utc() as f64
@@ -445,10 +525,10 @@ impl eframe::App for LivePlotApp {
                         if is_major {
                             if let Some(dt) = DateTime::from_timestamp(mark.value as i64, 0) {
                                 let local_dt = dt.with_timezone(&Local);
+                                let span = *range.end() - *range.start();
                                 if span > 86400.0 {
                                     local_dt.format("%m/%d %H:%M").to_string()
                                 } else if mark.step_size >= 60.0 {
-                                    // Requirement: Omit seconds if interval >= 1 minute
                                     local_dt.format("%H:%M").to_string()
                                 } else {
                                     local_dt.format("%H:%M:%S").to_string()
@@ -485,7 +565,7 @@ impl eframe::App for LivePlotApp {
                     {
                         self.auto_follow = false;
                     }
-                    let bounds = plot_ui.plot_bounds();
+                    let b = plot_ui.plot_bounds();
 
                     if self.auto_follow {
                         let width = def_w / self.x_zoom;
@@ -493,11 +573,11 @@ impl eframe::App for LivePlotApp {
                         let mut min_y_vis = f64::INFINITY;
                         let mut max_y_vis = f64::NEG_INFINITY;
                         let d = data_arc.lock().unwrap();
-                        for (i, b) in d.iter().enumerate() {
+                        for (i, buf) in d.iter().enumerate() {
                             if !visible[i] {
                                 continue;
                             }
-                            for p in b.iter().filter(|p| p[0] >= x_start) {
+                            for p in buf.iter().filter(|p| p[0] >= x_start) {
                                 min_y_vis = min_y_vis.min(p[1]);
                                 max_y_vis = max_y_vis.max(p[1]);
                             }
@@ -512,12 +592,10 @@ impl eframe::App for LivePlotApp {
                             let p = (max_y_vis - min_y_vis).max(0.1) * 0.05;
                             (min_y_vis - p, max_y_vis + p)
                         };
-                        self.y_center = (base.0 + base.1) / 2.0;
-                        self.y_nat_h = (base.1 - base.0).max(0.001);
-                        self.y_zoom = 1.0;
                         self.y_min = base.0;
                         self.y_max = base.1;
-                        self.x_center = last_x - (width / 2.0);
+                        self.y_nat_h = (base.1 - base.0).max(0.001);
+                        self.y_zoom = 1.0;
                         self.scroll_offset = x_start;
                         plot_ui.set_plot_bounds(PlotBounds::from_min_max(
                             [x_start, base.0],
@@ -525,55 +603,56 @@ impl eframe::App for LivePlotApp {
                         ));
                     } else if trigger {
                         let hh = (self.y_nat_h / self.y_zoom) / 2.0;
-                        let hw = (def_w / self.x_zoom) / 2.0;
                         let f_y_min = cur_y_center - hh;
                         let f_y_max = cur_y_center + hh;
                         plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                            [self.x_center - hw, f_y_min],
-                            [self.x_center + hw, f_y_max],
+                            [self.scroll_offset, f_y_min],
+                            [self.scroll_offset + (def_w / self.x_zoom), f_y_max],
                         ));
                         self.y_min = f_y_min;
                         self.y_max = f_y_max;
-                        self.scroll_offset = self.x_center - hw;
                     } else {
-                        self.x_center = bounds.center().x;
-                        self.y_center = bounds.center().y;
-                        self.y_min = bounds.min()[1];
-                        self.y_max = bounds.max()[1];
-                        self.scroll_offset = bounds.min()[0];
-                        if bounds.width() > 0.0 {
-                            self.x_zoom = def_w / bounds.width();
+                        self.scroll_offset = b.min()[0];
+                        self.y_min = b.min()[1];
+                        self.y_max = b.max()[1];
+                        if b.width() > 0.0 {
+                            self.x_zoom = def_w / b.width();
                         }
-                        if bounds.height() > 0.0 {
-                            self.y_zoom = (self.y_nat_h / bounds.height()).max(0.001);
+                        if b.height() > 0.0 {
+                            self.y_zoom = (self.y_nat_h / b.height()).max(0.001);
                         }
                     }
 
                     let d = data_arc.lock().unwrap();
-                    for (i, b) in d.iter().enumerate() {
-                        if !visible[i] {
+                    for (i, buf) in d.iter().enumerate() {
+                        if !visible[i] || buf.is_empty() {
                             continue;
                         }
-                        let slen = b.len();
-                        if slen == 0 {
+                        let start_idx = buf
+                            .binary_search_by(|p| p[0].partial_cmp(&b.min()[0]).unwrap())
+                            .unwrap_or_else(|e| e)
+                            .saturating_sub(1);
+                        let end_idx = buf
+                            .binary_search_by(|p| p[0].partial_cmp(&b.max()[0]).unwrap())
+                            .unwrap_or_else(|e| e)
+                            .min(buf.len());
+                        let visible_count = end_idx - start_idx;
+                        if visible_count == 0 {
                             continue;
                         }
-                        plot_ui.line(
-                            Line::new(PlotPoints::from_parametric_callback(
-                                move |t| {
-                                    let idx = t.round() as usize;
-                                    if idx < slen {
-                                        (b[idx][0], b[idx][1])
-                                    } else {
-                                        (0.0, 0.0)
-                                    }
-                                },
-                                0.0..=(slen as f64 - 1.0),
-                                slen,
-                            ))
-                            .name(&labels[i])
-                            .color(colors[i]),
+                        let step = (visible_count / 4000).max(1);
+                        let draw_count = visible_count / step;
+
+                        let points = PlotPoints::from_parametric_callback(
+                            move |t| {
+                                let g_idx = (start_idx + (t.round() as usize * step))
+                                    .min(end_idx.saturating_sub(1));
+                                (buf[g_idx][0], buf[g_idx][1])
+                            },
+                            0.0..=(draw_count as f64),
+                            draw_count + 1,
                         );
+                        plot_ui.line(Line::new(points).name(&labels[i]).color(colors[i]));
                     }
 
                     if let Some(mp) = plot_ui.pointer_coordinate() {
@@ -635,6 +714,7 @@ fn main() {
         .clone()
         .unwrap_or_else(|| vec!["Series 1".to_string()]);
     let label_count = raw_labels.len();
+
     let mut map: Vec<(usize, String)> = raw_labels.into_iter().enumerate().collect();
     if args.sort_labels {
         map.sort_by(|a, b| a.1.cmp(&b.1));
@@ -659,8 +739,6 @@ fn main() {
     let tau_thread = Arc::clone(&tau_shared);
     let stream_ended = Arc::new(AtomicBool::new(false));
     let stream_ended_thread = Arc::clone(&stream_ended);
-    let max_pts = args.max_points;
-    let app_args = args.clone();
 
     eframe::run_native(
         "Live Plotter",
@@ -684,12 +762,16 @@ fn main() {
                             .filter(|s| !s.is_empty())
                             .collect();
                         if tokens.len() != expected {
-                            eprintln!("FATAL: expected {} cols, found {}.", expected, tokens.len());
+                            eprintln!(
+                                "FATAL ERROR: expected {} cols, found {}.",
+                                expected,
+                                tokens.len()
+                            );
                             std::process::exit(1);
                         }
                         let (x, data_tokens) = if is_ts {
                             (
-                                tokens[0].parse::<f64>().expect("Time col 0 must be float"),
+                                tokens[0].parse::<f64>().expect("Time must be float"),
                                 &tokens[1..],
                             )
                         } else {
@@ -706,7 +788,7 @@ fn main() {
                                     continue;
                                 }
                                 if let Ok(v) = token.parse::<f64>() {
-                                    if rb[display_i].len() >= max_pts {
+                                    if rb[display_i].len() >= args.max_points {
                                         rb[display_i].remove(0);
                                     }
                                     rb[display_i].push([x, v]);
@@ -718,7 +800,7 @@ fn main() {
                                             j -= 1;
                                         }
                                     }
-                                    if sb[display_i].len() >= max_pts {
+                                    if sb[display_i].len() >= args.max_points {
                                         sb[display_i].remove(0);
                                     }
                                     let y = if let Some(last) = sb[display_i].last() {
@@ -746,7 +828,7 @@ fn main() {
                 ctx.request_repaint();
             });
             Ok(Box::new(LivePlotApp::new(
-                app_args,
+                args,
                 raw_buffer,
                 smooth_buffer,
                 tau_shared,
