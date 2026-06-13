@@ -244,6 +244,7 @@ struct LivePlotApp {
     anchor_y: YAnchor,
 
     last_view_rect: Option<[f64; 4]>,
+    status_label_width: Option<f32>,
 }
 
 impl LivePlotApp {
@@ -296,6 +297,7 @@ impl LivePlotApp {
             anchor_x: XAnchor::Right,
             anchor_y: YAnchor::Bottom,
             last_view_rect: None,
+            status_label_width: None,
         }
     }
 
@@ -515,16 +517,18 @@ impl eframe::App for LivePlotApp {
             ui.horizontal(|ui| {
                 ui.heading(&self.title);
 
-                let font_id = TextStyle::Body.resolve(ui.style());
-                let max_status_w = ui.fonts(|f| {
-                    ["• LIVE", "EXPLORE", "⚠️ Ended"]
-                        .iter()
-                        .map(|s| {
-                            f.layout_no_wrap(s.to_string(), font_id.clone(), Color32::WHITE)
-                                .rect
-                                .width()
-                        })
-                        .fold(0.0f32, f32::max)
+                let max_status_w = *self.status_label_width.get_or_insert_with(|| {
+                    let font_id = TextStyle::Body.resolve(ui.style());
+                    ui.fonts(|f| {
+                        ["• LIVE", "EXPLORE", "⚠️ Ended"]
+                            .iter()
+                            .map(|s| {
+                                f.layout_no_wrap(s.to_string(), font_id.clone(), Color32::WHITE)
+                                    .rect
+                                    .width()
+                            })
+                            .fold(0.0f32, f32::max)
+                    })
                 });
 
                 ui.add_sized([max_status_w + 10.0, 20.0], |ui: &mut egui::Ui| {
