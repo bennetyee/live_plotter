@@ -43,7 +43,7 @@ struct Args {
     #[arg(short, long, num_args = 1..)]
     colors: Option<Vec<String>>,
 
-    /// The title displayed at the top of the graph
+    /// The title displayed at the top of the graph (Long form only)
     #[arg(long, default_value = "Live Time-Series Feed")]
     title: String,
 
@@ -102,7 +102,6 @@ struct LivePlotApp {
     anchor_x: XAnchor,
     anchor_y: YAnchor,
 
-    // Animation guard: used to detect if egui_plot is animating a transition
     last_view_rect: Option<[f64; 4]>,
 }
 
@@ -115,7 +114,6 @@ impl LivePlotApp {
         stream_ended: Arc<AtomicBool>,
         labels: Vec<String>,
     ) -> Self {
-        let visible = vec![true; labels.len()];
         let legend_corner = match args.legend_pos.to_lowercase().as_str() {
             "none" => None,
             "lefttop" => Some(Corner::LeftTop),
@@ -135,9 +133,9 @@ impl LivePlotApp {
             stream_ended,
             tau_shared,
             include_y_values: args.include_y,
-            labels,
+            labels: labels.clone(),
             colors: Self::generate_palette(args.colors),
-            visible,
+            visible: vec![true; labels.len()],
             title: args.title,
             legend_corner,
             is_ts_mode: args.timestamp,
@@ -203,16 +201,13 @@ impl LivePlotApp {
             smooth_series.clear();
             if let Some(first) = raw_series.first() {
                 smooth_series.push(*first);
-                let mut prev_y = first[1];
-                let mut prev_t = first[0];
+                let (mut prev_y, mut prev_t) = (first[1], first[0]);
                 for point in raw_series.iter().skip(1) {
-                    let cur_t = point[0];
-                    let cur_x = point[1];
-                    let dt = (cur_t - prev_t).max(0.0);
+                    let (cur_t, cur_x) = (point[0], point[1]);
+                    let alpha = 1.0 - (-(cur_t - prev_t).max(0.0) / self.tau).exp();
                     let y = if self.tau <= 1e-6 {
                         cur_x
                     } else {
-                        let alpha = 1.0 - (-dt / self.tau).exp();
                         alpha * cur_x + (1.0 - alpha) * prev_y
                     };
                     smooth_series.push([cur_t, y]);
@@ -235,7 +230,7 @@ fn format_x_val(x: f64, is_ts: bool) -> String {
 
 impl eframe::App for LivePlotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // --- 1. SIDE PANEL ---
+        // --- 1. SETTINGS PANEL ---
         let panel_width = if self.side_panel_collapsed {
             28.0
         } else {
@@ -355,20 +350,36 @@ impl eframe::App for LivePlotApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             let mut first_x = 0.0;
             let mut last_x = 0.0;
+            let mut global_min_y = f64::INFINITY;
+            let mut global_max_y = f64::NEG_INFINITY;
+
             {
                 let d = self.raw_data.lock().unwrap();
-                let mut found = false;
+                let mut found_x = false;
                 for buf in d.iter() {
                     if let (Some(f), Some(l)) = (buf.first(), buf.last()) {
-                        if !found || f[0] < first_x {
+                        if !found_x || f[0] < first_x {
                             first_x = f[0];
                         }
-                        if !found || l[0] > last_x {
+                        if !found_x || l[0] > last_x {
                             last_x = l[0];
                         }
-                        found = true;
+                        found_x = true;
+                    }
+                    // For vertical zoom range logic
+                    for p in buf.iter() {
+                        if p[1] < global_min_y {
+                            global_min_y = p[1];
+                        }
+                        if p[1] > global_max_y {
+                            global_max_y = p[1];
+                        }
                     }
                 }
+            }
+            if global_min_y.is_infinite() {
+                global_min_y = -1.0;
+                global_max_y = 1.0;
             }
 
             let mut trigger = false;
@@ -464,20 +475,28 @@ impl eframe::App for LivePlotApp {
                     YAnchor::Bottom => self.y_min,
                 };
 
+                // Vertical column for Y-controls
                 ui.vertical(|ui| {
                     ui.label("Y-Anchor");
                     ui.selectable_value(&mut self.anchor_y, YAnchor::Top, "T");
                     ui.selectable_value(&mut self.anchor_y, YAnchor::Center, "C");
                     ui.selectable_value(&mut self.anchor_y, YAnchor::Bottom, "B");
                     ui.add_space(10.0);
-                    let vy_resp = ui.add_sized(
-                        [20.0, ui.available_height()],
-                        egui::Slider::new(&mut self.y_zoom, 0.5..=10.0)
-                            .vertical()
-                            .show_value(false)
-                            .logarithmic(true),
-                    );
-                    if vy_resp.changed() {
+
+                    // Dynamic Y-zoom range calculation
+                    // We ensure that we can always zoom out to see the entire buffer's range
+                    let min_zy = (self.y_nat_h / (global_max_y - global_min_y).max(0.1)).min(1.0);
+
+                    if ui
+                        .add_sized(
+                            [20.0, ui.available_height()],
+                            egui::Slider::new(&mut self.y_zoom, min_zy..=50.0)
+                                .vertical()
+                                .show_value(false)
+                                .logarithmic(true),
+                        )
+                        .changed()
+                    {
                         self.auto_follow = false;
                         trigger = true;
                         let new_y_h = self.y_nat_h / self.y_zoom;
@@ -552,13 +571,14 @@ impl eframe::App for LivePlotApp {
                             };
                         if ((mark.value + local_offset) % mark.step_size).abs() < 1e-5 {
                             if let Some(dt) = DateTime::from_timestamp(mark.value as i64, 0) {
-                                let local_dt = dt.with_timezone(&Local);
-                                if (*range.end() - *range.start()) > 86400.0 {
-                                    local_dt.format("%m/%d %H:%M").to_string()
+                                let ldt = dt.with_timezone(&Local);
+                                let span = *range.end() - *range.start();
+                                if span > 86400.0 {
+                                    ldt.format("%m/%d %H:%M").to_string()
                                 } else if mark.step_size >= 60.0 {
-                                    local_dt.format("%H:%M").to_string()
+                                    ldt.format("%H:%M").to_string()
                                 } else {
-                                    local_dt.format("%H:%M:%S").to_string()
+                                    ldt.format("%H:%M:%S").to_string()
                                 }
                             } else {
                                 "".into()
@@ -659,28 +679,44 @@ impl eframe::App for LivePlotApp {
                             .binary_search_by(|p| p[0].partial_cmp(&b.max()[0]).unwrap())
                             .unwrap_or_else(|e| e)
                             .min(buf.len());
-                        let visible_count = end_idx - start_idx;
-                        if visible_count == 0 {
+                        let count = end_idx - start_idx;
+                        if count == 0 {
                             continue;
                         }
-                        let step = (visible_count / 4000).max(1);
-                        let draw_count = visible_count / step;
-                        plot_ui.line(
-                            Line::new(PlotPoints::from_parametric_callback(
-                                move |t| {
-                                    let g_idx = (start_idx + (t.round() as usize * step))
-                                        .min(end_idx.saturating_sub(1));
-                                    (buf[g_idx][0], buf[g_idx][1])
-                                },
-                                0.0..=(draw_count as f64),
-                                draw_count + 1,
-                            ))
-                            .name(&labels[i])
-                            .color(colors[i]),
+
+                        let step = (count / 2000).max(1);
+                        let pts = PlotPoints::from_parametric_callback(
+                            move |t| {
+                                let bin_idx = t.round() as usize / 2;
+                                let is_max = t.round() as usize % 2 == 1;
+                                let b_start = start_idx + (bin_idx * step);
+                                let b_end = (b_start + step).min(end_idx);
+                                if b_start >= buf.len() {
+                                    return (0.0, 0.0);
+                                }
+                                let mut l_min = f64::INFINITY;
+                                let mut l_max = f64::NEG_INFINITY;
+                                let (mut mi, mut mai) = (b_start, b_start);
+                                for j in b_start..b_end {
+                                    if buf[j][1] < l_min {
+                                        l_min = buf[j][1];
+                                        mi = j;
+                                    }
+                                    if buf[j][1] > l_max {
+                                        l_max = buf[j][1];
+                                        mai = j;
+                                    }
+                                }
+                                let (f, s) = if mi < mai { (mi, mai) } else { (mai, mi) };
+                                let p = if is_max { buf[s] } else { buf[f] };
+                                (p[0], p[1])
+                            },
+                            0.0..=((count / step * 2) as f64),
+                            (count / step * 2) + 1,
                         );
+                        plot_ui.line(Line::new(pts).name(&labels[i]).color(colors[i]));
                     }
 
-                    // Tooltip
                     if let Some(mp) = plot_ui.pointer_coordinate() {
                         if let Some(rb) = d.get(0) {
                             let idx = rb
@@ -723,11 +759,10 @@ impl eframe::App for LivePlotApp {
                         }
                     }
 
-                    // --- ANIMATION GUARD ---
-                    let current_view = [b.min()[0], b.min()[1], b.max()[0], b.max()[1]];
-                    if self.last_view_rect != Some(current_view) {
-                        plot_ui.ctx().request_repaint();
-                        self.last_view_rect = Some(current_view);
+                    let cur_v = [b.min()[0], b.min()[1], b.max()[0], b.max()[1]];
+                    if self.last_view_rect != Some(cur_v) {
+                        ctx.request_repaint();
+                        self.last_view_rect = Some(cur_v);
                     }
                 });
                 if trigger || plot_res.response.dragged() {
@@ -747,6 +782,7 @@ fn main() {
         .clone()
         .unwrap_or_else(|| vec!["Series 1".to_string()]);
     let label_count = raw_labels.len();
+
     let mut map: Vec<(usize, String)> = raw_labels.into_iter().enumerate().collect();
     if args.sort_labels {
         map.sort_by(|a, b| a.1.cmp(&b.1));
