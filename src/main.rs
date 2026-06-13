@@ -9,34 +9,48 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "High-Performance Live Plotter")]
+#[command(author, version, about = "High-Performance Live Multi-Series Plotter")]
 struct Args {
     /// Maximum number of data points to display in the total buffer per series
     #[arg(short, long, default_value_t = 1000000)]
     max_points: usize,
+
     /// Initial number of X-axis units visible in the viewport
     #[arg(short, long, default_value_t = 500.0)]
     viewport_width: f64,
+
     /// Interpret the first column as a Unix timestamp (seconds since epoch)
     #[arg(short, long, default_value_t = false)]
     timestamp: bool,
+
     /// Fixed period in seconds between samples for non-timestamped data
     #[arg(long, default_value_t = 5.0)]
     sample_period: f64,
+
+    /// Y-axis values that should always be visible (baseline/ceiling)
     #[arg(long, num_args = 1..)]
     include_y: Vec<f64>,
+
+    /// Labels for the data series
     #[arg(short, long, num_args = 1..)]
     labels: Option<Vec<String>>,
+
     /// Sort labels alphabetically (default is command-line order)
     #[arg(long, default_value_t = false)]
     sort_labels: bool,
+
+    /// Hex colors for the lines (e.g., #ff0000 #00ff00)
     #[arg(short, long, num_args = 1..)]
     colors: Option<Vec<String>>,
+
+    /// The title displayed at the top of the graph
     #[arg(long, default_value = "Live Time-Series Feed")]
     title: String,
+
     /// Legend position: LeftTop, RightTop, LeftBottom, RightBottom, or None
     #[arg(long, default_value = "LeftTop")]
     legend_pos: String,
+
     /// Maximum smoothing time constant (tau) in seconds
     #[arg(long, default_value_t = 60.0)]
     max_tau: f64,
@@ -87,6 +101,9 @@ struct LivePlotApp {
     auto_follow: bool,
     anchor_x: XAnchor,
     anchor_y: YAnchor,
+
+    // Animation guard: used to detect if egui_plot is animating a transition
+    last_view_rect: Option<[f64; 4]>,
 }
 
 impl LivePlotApp {
@@ -107,7 +124,7 @@ impl LivePlotApp {
             "rightbottom" => Some(Corner::RightBottom),
             _ => {
                 eprintln!("FATAL ERROR: Invalid --legend-pos '{}'.", args.legend_pos);
-                eprintln!("Valid values are: LeftTop, RightTop, LeftBottom, RightBottom, None");
+                eprintln!("Valid values: LeftTop, RightTop, LeftBottom, RightBottom, None");
                 std::process::exit(1);
             }
         };
@@ -137,31 +154,32 @@ impl LivePlotApp {
             auto_follow: true,
             anchor_x: XAnchor::Center,
             anchor_y: YAnchor::Center,
+            last_view_rect: None,
         }
     }
 
     fn generate_palette(user_colors: Option<Vec<String>>) -> Vec<Color32> {
         let palette = vec![
-            Color32::from_rgb(255, 85, 85),   // Red
-            Color32::from_rgb(85, 255, 85),   // Green
-            Color32::from_rgb(85, 85, 255),   // Blue
-            Color32::from_rgb(255, 255, 85),  // Yellow
-            Color32::from_rgb(255, 85, 255),  // Magenta
-            Color32::from_rgb(85, 255, 255),  // Cyan
-            Color32::from_rgb(255, 170, 0),   // Orange
-            Color32::from_rgb(170, 0, 255),   // Purple
-            Color32::from_rgb(0, 255, 170),   // Teal
-            Color32::from_rgb(255, 0, 127),   // Rose
-            Color32::from_rgb(170, 255, 0),   // Lime
-            Color32::from_rgb(0, 170, 255),   // Azure
-            Color32::from_rgb(255, 215, 180), // Apricot
-            Color32::from_rgb(128, 128, 128), // Grey
-            Color32::from_rgb(170, 110, 40),  // Brown
-            Color32::from_rgb(0, 128, 128),   // Dark Teal
-            Color32::from_rgb(230, 190, 255), // Lavender
-            Color32::from_rgb(128, 0, 0),     // Maroon
-            Color32::from_rgb(170, 255, 195), // Mint
-            Color32::from_rgb(128, 128, 0),   // Olive
+            Color32::from_rgb(255, 85, 85),
+            Color32::from_rgb(85, 255, 85),
+            Color32::from_rgb(85, 85, 255),
+            Color32::from_rgb(255, 255, 85),
+            Color32::from_rgb(255, 85, 255),
+            Color32::from_rgb(85, 255, 255),
+            Color32::from_rgb(255, 170, 0),
+            Color32::from_rgb(170, 0, 255),
+            Color32::from_rgb(0, 255, 170),
+            Color32::from_rgb(255, 0, 127),
+            Color32::from_rgb(170, 255, 0),
+            Color32::from_rgb(0, 170, 255),
+            Color32::from_rgb(255, 215, 180),
+            Color32::from_rgb(128, 128, 128),
+            Color32::from_rgb(170, 110, 40),
+            Color32::from_rgb(0, 128, 128),
+            Color32::from_rgb(230, 190, 255),
+            Color32::from_rgb(128, 0, 0),
+            Color32::from_rgb(170, 255, 195),
+            Color32::from_rgb(128, 128, 0),
         ];
         let mut colors = Vec::new();
         if let Some(h) = user_colors {
@@ -217,7 +235,7 @@ fn format_x_val(x: f64, is_ts: bool) -> String {
 
 impl eframe::App for LivePlotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // --- 1. SETTINGS PANEL ---
+        // --- 1. SIDE PANEL ---
         let panel_width = if self.side_panel_collapsed {
             28.0
         } else {
@@ -360,7 +378,6 @@ impl eframe::App for LivePlotApp {
             ui.horizontal(|ui| {
                 ui.heading(&self.title);
 
-                // FIXED WIDTH STATUS AREA
                 let font_id = TextStyle::Body.resolve(ui.style());
                 let max_status_w = ui.fonts(|f| {
                     let w1 = f
@@ -415,7 +432,6 @@ impl eframe::App for LivePlotApp {
                         .show_value(false)
                         .logarithmic(true),
                 );
-
                 if zx_resp.changed() {
                     self.auto_follow = false;
                     trigger = true;
@@ -448,7 +464,6 @@ impl eframe::App for LivePlotApp {
                     YAnchor::Bottom => self.y_min,
                 };
 
-                // Vertical column for Y-controls
                 ui.vertical(|ui| {
                     ui.label("Y-Anchor");
                     ui.selectable_value(&mut self.anchor_y, YAnchor::Top, "T");
@@ -498,7 +513,7 @@ impl eframe::App for LivePlotApp {
                         let span = input.bounds.1 - input.bounds.0;
                         let steps = [
                             86400.0, 43200.0, 21600.0, 14400.0, 10800.0, 7200.0, 3600.0, 1800.0,
-                            900.0, 600.0, 300.0, 120.0, 60.0, 30.0, 15.0, 10.0, 5.0, 2.0, 1.0,
+                            900.0, 600.0, 300.0, 120.0, 60.0, 30.0, 15.0, 10.0, 5.0, 1.0,
                         ];
                         let major_step = steps
                             .iter()
@@ -630,6 +645,7 @@ impl eframe::App for LivePlotApp {
                         }
                     }
 
+                    // Optimized decimation render
                     let d = data_arc.lock().unwrap();
                     for (i, buf) in d.iter().enumerate() {
                         if !visible[i] || buf.is_empty() {
@@ -664,6 +680,7 @@ impl eframe::App for LivePlotApp {
                         );
                     }
 
+                    // Tooltip
                     if let Some(mp) = plot_ui.pointer_coordinate() {
                         if let Some(rb) = d.get(0) {
                             let idx = rb
@@ -704,6 +721,13 @@ impl eframe::App for LivePlotApp {
                                 }
                             }
                         }
+                    }
+
+                    // --- ANIMATION GUARD ---
+                    let current_view = [b.min()[0], b.min()[1], b.max()[0], b.max()[1]];
+                    if self.last_view_rect != Some(current_view) {
+                        plot_ui.ctx().request_repaint();
+                        self.last_view_rect = Some(current_view);
                     }
                 });
                 if trigger || plot_res.response.dragged() {
