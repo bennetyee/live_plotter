@@ -9,48 +9,34 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "High-Performance Live Multi-Series Plotter")]
+#[command(author, version, about = "High-Performance Live Plotter")]
 struct Args {
     /// Maximum number of data points to display in the total buffer per series
     #[arg(short, long, default_value_t = 1000000)]
     max_points: usize,
-
     /// Initial number of X-axis units visible in the viewport
     #[arg(short, long, default_value_t = 500.0)]
     viewport_width: f64,
-
     /// Interpret the first column as a Unix timestamp (seconds since epoch)
     #[arg(short, long, default_value_t = false)]
     timestamp: bool,
-
     /// Fixed period in seconds between samples for non-timestamped data
     #[arg(long, default_value_t = 5.0)]
     sample_period: f64,
-
-    /// Y-axis values that should always be visible (baseline/ceiling)
     #[arg(long, num_args = 1..)]
     include_y: Vec<f64>,
-
-    /// Labels for the data series
     #[arg(short, long, num_args = 1..)]
     labels: Option<Vec<String>>,
-
     /// Sort labels alphabetically (default is command-line order)
     #[arg(long, default_value_t = false)]
     sort_labels: bool,
-
-    /// Hex colors for the lines (e.g., #ff0000 #00ff00)
     #[arg(short, long, num_args = 1..)]
     colors: Option<Vec<String>>,
-
-    /// The title displayed at the top of the graph (Long form only)
     #[arg(long, default_value = "Live Time-Series Feed")]
     title: String,
-
     /// Legend position: LeftTop, RightTop, LeftBottom, RightBottom, or None
     #[arg(long, default_value = "LeftTop")]
     legend_pos: String,
-
     /// Maximum smoothing time constant (tau) in seconds
     #[arg(long, default_value_t = 60.0)]
     max_tau: f64,
@@ -59,10 +45,17 @@ struct Args {
 type SeriesBuffer = Vec<[f64; 2]>;
 
 #[derive(PartialEq, Clone, Copy)]
-enum ZoomAnchor {
+enum XAnchor {
     Left,
     Center,
     Right,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum YAnchor {
+    Top,
+    Center,
+    Bottom,
 }
 
 struct LivePlotApp {
@@ -86,13 +79,14 @@ struct LivePlotApp {
 
     // Viewport State
     x_zoom: f64,
-    scroll_offset: f64, // Left edge of the viewport
+    scroll_offset: f64,
     y_zoom: f64,
     y_min: f64,
     y_max: f64,
     y_nat_h: f64,
     auto_follow: bool,
-    anchor: ZoomAnchor,
+    anchor_x: XAnchor,
+    anchor_y: YAnchor,
 }
 
 impl LivePlotApp {
@@ -141,32 +135,33 @@ impl LivePlotApp {
             y_max: 1.0,
             y_nat_h: 1.0,
             auto_follow: true,
-            anchor: ZoomAnchor::Center,
+            anchor_x: XAnchor::Center,
+            anchor_y: YAnchor::Center,
         }
     }
 
     fn generate_palette(user_colors: Option<Vec<String>>) -> Vec<Color32> {
         let palette = vec![
-            Color32::from_rgb(255, 85, 85),
-            Color32::from_rgb(85, 255, 85),
-            Color32::from_rgb(85, 85, 255),
-            Color32::from_rgb(255, 255, 85),
-            Color32::from_rgb(255, 85, 255),
-            Color32::from_rgb(85, 255, 255),
-            Color32::from_rgb(255, 170, 0),
-            Color32::from_rgb(170, 0, 255),
-            Color32::from_rgb(0, 255, 170),
-            Color32::from_rgb(255, 0, 127),
-            Color32::from_rgb(170, 255, 0),
-            Color32::from_rgb(0, 170, 255),
-            Color32::from_rgb(255, 215, 180),
-            Color32::from_rgb(128, 128, 128),
-            Color32::from_rgb(170, 110, 40),
-            Color32::from_rgb(0, 128, 128),
-            Color32::from_rgb(230, 190, 255),
-            Color32::from_rgb(128, 0, 0),
-            Color32::from_rgb(170, 255, 195),
-            Color32::from_rgb(128, 128, 0),
+            Color32::from_rgb(255, 85, 85),   // Red
+            Color32::from_rgb(85, 255, 85),   // Green
+            Color32::from_rgb(85, 85, 255),   // Blue
+            Color32::from_rgb(255, 255, 85),  // Yellow
+            Color32::from_rgb(255, 85, 255),  // Magenta
+            Color32::from_rgb(85, 255, 255),  // Cyan
+            Color32::from_rgb(255, 170, 0),   // Orange
+            Color32::from_rgb(170, 0, 255),   // Purple
+            Color32::from_rgb(0, 255, 170),   // Teal
+            Color32::from_rgb(255, 0, 127),   // Rose
+            Color32::from_rgb(170, 255, 0),   // Lime
+            Color32::from_rgb(0, 170, 255),   // Azure
+            Color32::from_rgb(255, 215, 180), // Apricot
+            Color32::from_rgb(128, 128, 128), // Grey
+            Color32::from_rgb(170, 110, 40),  // Brown
+            Color32::from_rgb(0, 128, 128),   // Dark Teal
+            Color32::from_rgb(230, 190, 255), // Lavender
+            Color32::from_rgb(128, 0, 0),     // Maroon
+            Color32::from_rgb(170, 255, 195), // Mint
+            Color32::from_rgb(128, 128, 0),   // Olive
         ];
         let mut colors = Vec::new();
         if let Some(h) = user_colors {
@@ -397,22 +392,18 @@ impl eframe::App for LivePlotApp {
                 });
 
                 ui.separator();
-
-                // --- ZOOM ANCHOR SELECTOR ---
-                ui.label("Anchor:");
-                ui.selectable_value(&mut self.anchor, ZoomAnchor::Left, "L");
-                ui.selectable_value(&mut self.anchor, ZoomAnchor::Center, "C");
-                ui.selectable_value(&mut self.anchor, ZoomAnchor::Right, "R");
+                ui.label("X-Anchor:");
+                ui.selectable_value(&mut self.anchor_x, XAnchor::Left, "L");
+                ui.selectable_value(&mut self.anchor_x, XAnchor::Center, "C");
+                ui.selectable_value(&mut self.anchor_x, XAnchor::Right, "R");
 
                 ui.separator();
                 ui.label("X-Zoom:");
-
-                // Before slider changes, calculate current width and anchor point
-                let old_width = self.default_width / self.x_zoom;
-                let anchor_x = match self.anchor {
-                    ZoomAnchor::Left => self.scroll_offset,
-                    ZoomAnchor::Center => self.scroll_offset + (old_width / 2.0),
-                    ZoomAnchor::Right => self.scroll_offset + old_width,
+                let cur_x_w = self.default_width / self.x_zoom;
+                let cur_x_anchor = match self.anchor_x {
+                    XAnchor::Left => self.scroll_offset,
+                    XAnchor::Center => self.scroll_offset + (cur_x_w / 2.0),
+                    XAnchor::Right => self.scroll_offset + cur_x_w,
                 };
 
                 let slider_w = (ui.available_width() - 115.0).max(50.0);
@@ -428,15 +419,13 @@ impl eframe::App for LivePlotApp {
                 if zx_resp.changed() {
                     self.auto_follow = false;
                     trigger = true;
-                    // Recalculate scroll_offset to keep anchor_x fixed
-                    let new_width = self.default_width / self.x_zoom;
-                    self.scroll_offset = match self.anchor {
-                        ZoomAnchor::Left => anchor_x,
-                        ZoomAnchor::Center => anchor_x - (new_width / 2.0),
-                        ZoomAnchor::Right => anchor_x - new_width,
+                    let new_x_w = self.default_width / self.x_zoom;
+                    self.scroll_offset = match self.anchor_x {
+                        XAnchor::Left => cur_x_anchor,
+                        XAnchor::Center => cur_x_anchor - (new_x_w / 2.0),
+                        XAnchor::Right => cur_x_anchor - new_x_w,
                     };
                 }
-
                 if ui.button("Reset Viewport").clicked() {
                     self.x_zoom = 1.0;
                     self.y_zoom = 1.0;
@@ -453,21 +442,46 @@ impl eframe::App for LivePlotApp {
                 egui::Layout::left_to_right(egui::Align::Min).with_cross_justify(true);
             ui.with_layout(body_layout, |ui| {
                 let cur_y_h = (self.y_max - self.y_min).max(0.0001);
-                let cur_y_center = self.y_min + (cur_y_h / 2.0);
+                let cur_y_anchor = match self.anchor_y {
+                    YAnchor::Top => self.y_max,
+                    YAnchor::Center => self.y_min + (cur_y_h / 2.0),
+                    YAnchor::Bottom => self.y_min,
+                };
 
-                if ui
-                    .add_sized(
+                // Vertical column for Y-controls
+                ui.vertical(|ui| {
+                    ui.label("Y-Anchor");
+                    ui.selectable_value(&mut self.anchor_y, YAnchor::Top, "T");
+                    ui.selectable_value(&mut self.anchor_y, YAnchor::Center, "C");
+                    ui.selectable_value(&mut self.anchor_y, YAnchor::Bottom, "B");
+                    ui.add_space(10.0);
+                    let vy_resp = ui.add_sized(
                         [20.0, ui.available_height()],
                         egui::Slider::new(&mut self.y_zoom, 0.5..=10.0)
                             .vertical()
                             .show_value(false)
                             .logarithmic(true),
-                    )
-                    .changed()
-                {
-                    self.auto_follow = false;
-                    trigger = true;
-                }
+                    );
+                    if vy_resp.changed() {
+                        self.auto_follow = false;
+                        trigger = true;
+                        let new_y_h = self.y_nat_h / self.y_zoom;
+                        match self.anchor_y {
+                            YAnchor::Top => {
+                                self.y_max = cur_y_anchor;
+                                self.y_min = self.y_max - new_y_h;
+                            }
+                            YAnchor::Center => {
+                                self.y_min = cur_y_anchor - (new_y_h / 2.0);
+                                self.y_max = cur_y_anchor + (new_y_h / 2.0);
+                            }
+                            YAnchor::Bottom => {
+                                self.y_min = cur_y_anchor;
+                                self.y_max = self.y_min + new_y_h;
+                            }
+                        }
+                    }
+                });
 
                 let mut plot = Plot::new("lp")
                     .height(ui.available_height() - 4.0)
@@ -521,12 +535,10 @@ impl eframe::App for LivePlotApp {
                             } else {
                                 0.0
                             };
-                        let is_major = ((mark.value + local_offset) % mark.step_size).abs() < 1e-5;
-                        if is_major {
+                        if ((mark.value + local_offset) % mark.step_size).abs() < 1e-5 {
                             if let Some(dt) = DateTime::from_timestamp(mark.value as i64, 0) {
                                 let local_dt = dt.with_timezone(&Local);
-                                let span = *range.end() - *range.start();
-                                if span > 86400.0 {
+                                if (*range.end() - *range.start()) > 86400.0 {
                                     local_dt.format("%m/%d %H:%M").to_string()
                                 } else if mark.step_size >= 60.0 {
                                     local_dt.format("%H:%M").to_string()
@@ -602,15 +614,10 @@ impl eframe::App for LivePlotApp {
                             [last_x, base.1],
                         ));
                     } else if trigger {
-                        let hh = (self.y_nat_h / self.y_zoom) / 2.0;
-                        let f_y_min = cur_y_center - hh;
-                        let f_y_max = cur_y_center + hh;
                         plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                            [self.scroll_offset, f_y_min],
-                            [self.scroll_offset + (def_w / self.x_zoom), f_y_max],
+                            [self.scroll_offset, self.y_min],
+                            [self.scroll_offset + (def_w / self.x_zoom), self.y_max],
                         ));
-                        self.y_min = f_y_min;
-                        self.y_max = f_y_max;
                     } else {
                         self.scroll_offset = b.min()[0];
                         self.y_min = b.min()[1];
@@ -642,17 +649,19 @@ impl eframe::App for LivePlotApp {
                         }
                         let step = (visible_count / 4000).max(1);
                         let draw_count = visible_count / step;
-
-                        let points = PlotPoints::from_parametric_callback(
-                            move |t| {
-                                let g_idx = (start_idx + (t.round() as usize * step))
-                                    .min(end_idx.saturating_sub(1));
-                                (buf[g_idx][0], buf[g_idx][1])
-                            },
-                            0.0..=(draw_count as f64),
-                            draw_count + 1,
+                        plot_ui.line(
+                            Line::new(PlotPoints::from_parametric_callback(
+                                move |t| {
+                                    let g_idx = (start_idx + (t.round() as usize * step))
+                                        .min(end_idx.saturating_sub(1));
+                                    (buf[g_idx][0], buf[g_idx][1])
+                                },
+                                0.0..=(draw_count as f64),
+                                draw_count + 1,
+                            ))
+                            .name(&labels[i])
+                            .color(colors[i]),
                         );
-                        plot_ui.line(Line::new(points).name(&labels[i]).color(colors[i]));
                     }
 
                     if let Some(mp) = plot_ui.pointer_coordinate() {
@@ -714,7 +723,6 @@ fn main() {
         .clone()
         .unwrap_or_else(|| vec!["Series 1".to_string()]);
     let label_count = raw_labels.len();
-
     let mut map: Vec<(usize, String)> = raw_labels.into_iter().enumerate().collect();
     if args.sort_labels {
         map.sort_by(|a, b| a.1.cmp(&b.1));
@@ -727,7 +735,6 @@ fn main() {
         }
         inv
     };
-
     let expected = if is_ts { label_count + 1 } else { label_count };
     let raw_buffer: Arc<Mutex<Vec<SeriesBuffer>>> =
         Arc::new(Mutex::new(vec![Vec::new(); label_count]));
@@ -739,7 +746,8 @@ fn main() {
     let tau_thread = Arc::clone(&tau_shared);
     let stream_ended = Arc::new(AtomicBool::new(false));
     let stream_ended_thread = Arc::clone(&stream_ended);
-
+    let max_pts = args.max_points;
+    let app_args = args.clone();
     eframe::run_native(
         "Live Plotter",
         eframe::NativeOptions {
@@ -788,7 +796,7 @@ fn main() {
                                     continue;
                                 }
                                 if let Ok(v) = token.parse::<f64>() {
-                                    if rb[display_i].len() >= args.max_points {
+                                    if rb[display_i].len() >= max_pts {
                                         rb[display_i].remove(0);
                                     }
                                     rb[display_i].push([x, v]);
@@ -800,7 +808,7 @@ fn main() {
                                             j -= 1;
                                         }
                                     }
-                                    if sb[display_i].len() >= args.max_points {
+                                    if sb[display_i].len() >= max_pts {
                                         sb[display_i].remove(0);
                                     }
                                     let y = if let Some(last) = sb[display_i].last() {
@@ -828,7 +836,7 @@ fn main() {
                 ctx.request_repaint();
             });
             Ok(Box::new(LivePlotApp::new(
-                args,
+                app_args,
                 raw_buffer,
                 smooth_buffer,
                 tau_shared,
