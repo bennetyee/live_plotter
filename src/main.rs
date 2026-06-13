@@ -143,7 +143,8 @@ fn m4(buf: &SeriesBuffer, start: usize, end: usize, n_buckets: usize) -> Vec<[f6
     let count = end - start;
     if n_buckets == 0 || count <= n_buckets * 4 {
         // Already at or below target density — return as-is.
-        return (start..end).map(|i| buf.data[i]).collect();
+        // Use make_contiguous-free slice iteration via range on the VecDeque.
+        return buf.data.range(start..end).copied().collect();
     }
 
     let mut out: Vec<[f64; 2]> = Vec::with_capacity(n_buckets * 4);
@@ -245,6 +246,8 @@ struct LivePlotApp {
 
     last_view_rect: Option<[f64; 4]>,
     status_label_width: Option<f32>,
+    /// Counts down from N after last interaction; >0 means use coarse M4.
+    interacting_frames: u8,
 }
 
 impl LivePlotApp {
@@ -298,6 +301,7 @@ impl LivePlotApp {
             anchor_y: YAnchor::Bottom,
             last_view_rect: None,
             status_label_width: None,
+            interacting_frames: 0,
         }
     }
 
@@ -794,9 +798,28 @@ impl eframe::App for LivePlotApp {
                     }
 
                     // --- M4 min/max binning render ---
-                    // One bucket per screen pixel column guarantees every spike is visible.
+                    // Detect active interaction (drag or scroll) and use a coarser bucket
+                    // count while the user is moving the viewport, switching back to
+                    // full-resolution a few frames after interaction stops.  This keeps
+                    // rendering cheap during the frames that matter for perceived
+                    // responsiveness while still showing full detail at rest.
+                    let is_interacting = plot_ui.pointer_coordinate_drag_delta().length() > 0.0
+                        || plot_ui.ctx().input(|i| i.raw_scroll_delta.length()) > 0.0;
+                    if is_interacting {
+                        self.interacting_frames = 6; // ~100ms at 60fps
+                    } else if self.interacting_frames > 0 {
+                        self.interacting_frames -= 1;
+                        ctx.request_repaint(); // ensure we render the final full-res frame
+                    }
+                    let coarse = self.interacting_frames > 0;
+
                     let d = data_arc.lock().unwrap();
-                    let n_buckets = max_render.unwrap_or(plot_pixel_w).max(16);
+                    let full_buckets = max_render.unwrap_or(plot_pixel_w).max(16);
+                    let n_buckets = if coarse {
+                        (full_buckets / 4).max(16)
+                    } else {
+                        full_buckets
+                    };
 
                     for (i, buf) in d.iter().enumerate() {
                         if !visible[i] || buf.is_empty() {
