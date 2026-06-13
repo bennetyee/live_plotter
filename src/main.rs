@@ -69,7 +69,7 @@ struct Args {
     #[arg(long)]
     output: Option<String>,
 
-    /// Max rendered points per series (LTTB target). Default auto-sizes to 4x pixel width.
+    /// Override the number of M4 buckets (default = plot pixel width, one bucket per column).
     #[arg(long)]
     max_render_points: Option<usize>,
 }
@@ -127,58 +127,72 @@ impl SeriesBuffer {
 }
 
 // ---------------------------------------------------------------------------
-// LTTB – Largest-Triangle-Three-Buckets decimation
-// Returns at most `threshold` points from the slice [start..end] of `buf`,
-// preserving the visual shape of the time series.
+// M4 decimation – min/max binning for spike-preserving downsampling.
+//
+// For each pixel-width bucket we emit up to 4 points in time order:
+//   first, min, max, last
+// This guarantees that every spike (excursion above or below the surrounding
+// values) is visible in the output regardless of how many raw samples it
+// spans.  Grafana, TimescaleDB, and logic analyzers use this approach for
+// exactly this reason: missed extremes are a correctness failure in a
+// monitoring tool.
+//
+// `n_buckets` is typically the plot pixel width (one bucket per screen column).
 // ---------------------------------------------------------------------------
-fn lttb(buf: &SeriesBuffer, start: usize, end: usize, threshold: usize) -> Vec<[f64; 2]> {
+fn m4(buf: &SeriesBuffer, start: usize, end: usize, n_buckets: usize) -> Vec<[f64; 2]> {
     let count = end - start;
-    if threshold == 0 || count <= threshold {
+    if n_buckets == 0 || count <= n_buckets * 4 {
+        // Already at or below target density — return as-is.
         return (start..end).map(|i| buf.data[i]).collect();
     }
 
-    let mut sampled: Vec<[f64; 2]> = Vec::with_capacity(threshold);
-    // Always keep the first point.
-    sampled.push(buf.data[start]);
+    let mut out: Vec<[f64; 2]> = Vec::with_capacity(n_buckets * 4);
+    let bucket_size = count as f64 / n_buckets as f64;
 
-    let bucket_size = (count - 2) as f64 / (threshold - 2) as f64;
-    let mut a = 0usize; // index of last selected point (relative to start)
+    for b in 0..n_buckets {
+        let b_start = start + (b as f64 * bucket_size) as usize;
+        let b_end = (start + ((b + 1) as f64 * bucket_size) as usize).min(end);
+        if b_start >= b_end {
+            continue;
+        }
 
-    for i in 0..(threshold - 2) {
-        // Calculate the range for this bucket
-        let b_start = (((i + 1) as f64 * bucket_size) as usize + 1).min(count - 1);
-        let b_end = ((((i + 2) as f64 * bucket_size) as usize) + 1).min(count - 1);
+        let first = buf.data[b_start];
+        let last = buf.data[b_end - 1];
 
-        // Calculate the average point in the NEXT bucket (the "C" point)
-        let c_start = b_end;
-        let c_end = ((((i + 3) as f64 * bucket_size) as usize) + 1).min(count);
-        let avg_len = (c_end - c_start).max(1) as f64;
-        let (avg_x, avg_y) = (c_start..c_end).fold((0.0, 0.0), |(ax, ay), idx| {
-            (ax + buf.data[start + idx][0], ay + buf.data[start + idx][1])
-        });
-        let (avg_x, avg_y) = (avg_x / avg_len, avg_y / avg_len);
-
-        // Find the point in this bucket that forms the largest triangle with A and avg(C)
-        let ax = buf.data[start + a][0];
-        let ay = buf.data[start + a][1];
-        let mut max_area = -1.0f64;
-        let mut max_idx = b_start;
-        for j in b_start..b_end {
-            let px = buf.data[start + j][0];
-            let py = buf.data[start + j][1];
-            let area = ((ax - avg_x) * (py - ay) - (ax - px) * (avg_y - ay)).abs();
-            if area > max_area {
-                max_area = area;
-                max_idx = j;
+        let mut min_v = first[1];
+        let mut max_v = first[1];
+        let mut min_i = b_start;
+        let mut max_i = b_start;
+        for i in b_start..b_end {
+            let y = buf.data[i][1];
+            if y < min_v {
+                min_v = y;
+                min_i = i;
+            }
+            if y > max_v {
+                max_v = y;
+                max_i = i;
             }
         }
-        sampled.push(buf.data[start + max_idx]);
-        a = max_idx;
-    }
 
-    // Always keep the last point.
-    sampled.push(buf.data[start + count - 1]);
-    sampled
+        // Collect the up-to-4 candidate points, deduplicated, in time order.
+        let mut pts = [
+            (b_start, first),
+            (min_i, buf.data[min_i]),
+            (max_i, buf.data[max_i]),
+            (b_end - 1, last),
+        ];
+        pts.sort_unstable_by_key(|(i, _)| *i);
+
+        let mut prev_i = usize::MAX;
+        for (i, p) in pts {
+            if i != prev_i {
+                out.push(p);
+                prev_i = i;
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -775,10 +789,10 @@ impl eframe::App for LivePlotApp {
                         }
                     }
 
-                    // --- LTTB decimation render ---
+                    // --- M4 min/max binning render ---
+                    // One bucket per screen pixel column guarantees every spike is visible.
                     let d = data_arc.lock().unwrap();
-                    // Target: 4 samples per pixel (2x Nyquist), capped at max_render_points.
-                    let render_target = max_render.unwrap_or(plot_pixel_w * 4).max(64);
+                    let n_buckets = max_render.unwrap_or(plot_pixel_w).max(16);
 
                     for (i, buf) in d.iter().enumerate() {
                         if !visible[i] || buf.is_empty() {
@@ -791,13 +805,7 @@ impl eframe::App for LivePlotApp {
                             continue;
                         }
 
-                        let pts = if count <= render_target {
-                            // No decimation needed — pass points directly.
-                            PlotPoints::new((start_idx..end_idx).map(|j| buf.data[j]).collect())
-                        } else {
-                            let decimated = lttb(buf, start_idx, end_idx, render_target);
-                            PlotPoints::new(decimated.into_iter().collect())
-                        };
+                        let pts = PlotPoints::new(m4(buf, start_idx, end_idx, n_buckets));
                         plot_ui.line(Line::new(pts).name(&labels[i]).color(colors[i]));
                     }
 
