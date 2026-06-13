@@ -74,7 +74,7 @@ packages still have this performance issue.
 ## Disclaimer
 
 The code in this repo is entirely vibe coded using
-http://aistudio.google.com/.  The only manual thing done other than
-cutting-and-pasting the AI Studio generated code into the repository
-is occasionally remembering to run `rustfmt`; the Studio generated
-code sometimes has extraneous trailing spaces and the like.
+https://aistudio.google.com/ and https://claude.ai.  The only manual thing
+done other than downloading the AI generated code into the repository
+is occasionally remembering to run `rustfmt` and reviewing the code,
+mostly using `git diff`.
