@@ -80,48 +80,187 @@ impl SeriesBuffer {
     }
 }
 
-/// M4 min/max binning decimation.
+/// Estimate the typical inter-sample interval from up to `n` consecutive
+/// gaps in the buffer starting at `start`, returning the median.
+/// Used to detect data gaps for NaN sentinel insertion.
+fn typical_interval(buf: &SeriesBuffer, start: usize, end: usize) -> f64 {
+    let n = (end - start).min(64); // sample up to 64 gaps
+    if n < 2 {
+        return f64::INFINITY;
+    }
+    let mut gaps: Vec<f64> = (start..start + n - 1)
+        .map(|i| buf.data[i + 1][0] - buf.data[i][0])
+        .filter(|&g| g > 0.0)
+        .collect();
+    if gaps.is_empty() {
+        return f64::INFINITY;
+    }
+    gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    gaps[gaps.len() / 2]
+}
+
+/// M4 min/max binning decimation with gap detection.
 ///
 /// Emits up to 4 points per bucket (first, min, max, last) in time order,
 /// guaranteeing every spike is visible regardless of zoom level.
 /// `n_buckets` should equal the plot pixel width for one bucket per column.
+///
+/// When a gap in X larger than `gap_factor` × the typical sample interval is
+/// detected — either within a bucket or between consecutive output points — a
+/// NaN sentinel ([x, NAN]) is inserted so egui_plot renders a break in the
+/// line rather than a spurious straight line across the gap.
 fn m4(buf: &SeriesBuffer, start: usize, end: usize, n_buckets: usize) -> Vec<[f64; 2]> {
     let count = end - start;
+
+    // Compute gap threshold once: gaps > 4× typical interval are real outages.
+    let gap_threshold = typical_interval(buf, start, end) * 4.0;
+
+    // Helper: emit a NaN break between two x positions if they are gap-separated.
+    // The NaN is placed at the midpoint so the break appears at the right location.
+    let nan_pt = |x_left: f64, x_right: f64| -> Option<[f64; 2]> {
+        if gap_threshold.is_finite() && (x_right - x_left) > gap_threshold {
+            Some([(x_left + x_right) * 0.5, f64::NAN])
+        } else {
+            None
+        }
+    };
+
     if n_buckets == 0 || count <= n_buckets * 4 {
-        return buf.data.range(start..end).copied().collect();
+        // No decimation — pass through with gap sentinels inserted inline.
+        let mut out = Vec::with_capacity(count + 4);
+        for i in start..end {
+            if i > start {
+                if let Some(nan) = nan_pt(buf.data[i - 1][0], buf.data[i][0]) {
+                    out.push(nan);
+                }
+            }
+            out.push(buf.data[i]);
+        }
+        return out;
     }
-    let mut out = Vec::with_capacity(n_buckets * 4);
+
+    let mut out = Vec::with_capacity(n_buckets * 4 + n_buckets);
     let step = count as f64 / n_buckets as f64;
+    let mut prev_last_x: Option<f64> = None;
+
     for b in 0..n_buckets {
         let bs = start + (b as f64 * step) as usize;
         let be = (start + ((b + 1) as f64 * step) as usize).min(end);
         if bs >= be {
             continue;
         }
-        let mut min_i = bs;
-        let mut max_i = bs;
-        for i in bs..be {
-            if buf.data[i][1] < buf.data[min_i][1] {
-                min_i = i;
-            }
-            if buf.data[i][1] > buf.data[max_i][1] {
-                max_i = i;
+
+        // Check for a gap between the previous bucket's last point and this
+        // bucket's first point.
+        if let Some(plx) = prev_last_x {
+            if let Some(nan) = nan_pt(plx, buf.data[bs][0]) {
+                out.push(nan);
             }
         }
-        let mut pts = [
-            (bs, buf.data[bs]),
-            (min_i, buf.data[min_i]),
-            (max_i, buf.data[max_i]),
-            (be - 1, buf.data[be - 1]),
-        ];
-        pts.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let mut last_i = usize::MAX;
-        for (idx, p) in pts {
-            if idx != last_i {
-                out.push(p);
-                last_i = idx;
+
+        // Find the largest intra-bucket gap to detect gaps inside the bucket.
+        let mut intra_gap_pos: Option<usize> = None; // index of right side of largest gap
+        let mut intra_gap_size = 0.0f64;
+        for i in bs..be - 1 {
+            let g = buf.data[i + 1][0] - buf.data[i][0];
+            if g > intra_gap_size {
+                intra_gap_size = g;
+                intra_gap_pos = Some(i + 1);
             }
         }
+        let has_intra_gap = gap_threshold.is_finite() && intra_gap_size > gap_threshold;
+
+        if has_intra_gap {
+            // Split the bucket at the gap: emit first half, NaN, second half.
+            let gap_i = intra_gap_pos.unwrap();
+
+            // Left sub-bucket: [bs, gap_i)
+            if gap_i > bs {
+                let mut min_i = bs;
+                let mut max_i = bs;
+                for i in bs..gap_i {
+                    if buf.data[i][1] < buf.data[min_i][1] {
+                        min_i = i;
+                    }
+                    if buf.data[i][1] > buf.data[max_i][1] {
+                        max_i = i;
+                    }
+                }
+                let mut pts = [
+                    (bs, buf.data[bs]),
+                    (min_i, buf.data[min_i]),
+                    (max_i, buf.data[max_i]),
+                    (gap_i - 1, buf.data[gap_i - 1]),
+                ];
+                pts.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                let mut last_i = usize::MAX;
+                for (idx, p) in pts {
+                    if idx != last_i {
+                        out.push(p);
+                        last_i = idx;
+                    }
+                }
+            }
+
+            // NaN sentinel at the gap midpoint.
+            out.push(nan_pt(buf.data[gap_i - 1][0], buf.data[gap_i][0]).unwrap());
+
+            // Right sub-bucket: [gap_i, be)
+            if be > gap_i {
+                let mut min_i = gap_i;
+                let mut max_i = gap_i;
+                for i in gap_i..be {
+                    if buf.data[i][1] < buf.data[min_i][1] {
+                        min_i = i;
+                    }
+                    if buf.data[i][1] > buf.data[max_i][1] {
+                        max_i = i;
+                    }
+                }
+                let mut pts = [
+                    (gap_i, buf.data[gap_i]),
+                    (min_i, buf.data[min_i]),
+                    (max_i, buf.data[max_i]),
+                    (be - 1, buf.data[be - 1]),
+                ];
+                pts.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                let mut last_i = usize::MAX;
+                for (idx, p) in pts {
+                    if idx != last_i {
+                        out.push(p);
+                        last_i = idx;
+                    }
+                }
+            }
+        } else {
+            // Normal bucket — no intra-bucket gap.
+            let mut min_i = bs;
+            let mut max_i = bs;
+            for i in bs..be {
+                if buf.data[i][1] < buf.data[min_i][1] {
+                    min_i = i;
+                }
+                if buf.data[i][1] > buf.data[max_i][1] {
+                    max_i = i;
+                }
+            }
+            let mut pts = [
+                (bs, buf.data[bs]),
+                (min_i, buf.data[min_i]),
+                (max_i, buf.data[max_i]),
+                (be - 1, buf.data[be - 1]),
+            ];
+            pts.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            let mut last_i = usize::MAX;
+            for (idx, p) in pts {
+                if idx != last_i {
+                    out.push(p);
+                    last_i = idx;
+                }
+            }
+        }
+
+        prev_last_x = Some(buf.data[be - 1][0]);
     }
     out
 }
