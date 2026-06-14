@@ -54,85 +54,99 @@ impl SeriesBuffer {
         }
         self.data.push_back(point);
     }
-    fn len(&self) -> usize {
-        self.data.len()
-    }
-    fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
+    fn len(&self) -> usize { self.data.len() }
+    fn is_empty(&self) -> bool { self.data.is_empty() }
     fn search_x(&self, x: f64) -> usize {
         let (mut lo, mut hi) = (0usize, self.data.len());
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.data[mid][0] < x {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
+            if self.data[mid][0] < x { lo = mid + 1; } else { hi = mid; }
         }
         lo
     }
-    fn first(&self) -> Option<&[f64; 2]> {
-        self.data.front()
-    }
-    fn last(&self) -> Option<&[f64; 2]> {
-        self.data.back()
-    }
+    fn first(&self) -> Option<&[f64; 2]> { self.data.front() }
+    fn last(&self) -> Option<&[f64; 2]> { self.data.back() }
 }
 
-fn m4(buf: &SeriesBuffer, start: usize, end: usize, n_buckets: usize) -> Vec<[f64; 2]> {
+fn m4(buf: &SeriesBuffer, start: usize, end: usize, n_buckets: usize, view_min_x: f64, view_max_x: f64) -> Vec<[f64; 2]> {
     let count = end - start;
     if n_buckets == 0 || count <= n_buckets * 4 {
         return buf.data.range(start..end).copied().collect();
     }
+
     let mut out = Vec::with_capacity(n_buckets * 4);
-    let step = count as f64 / n_buckets as f64;
-    for b in 0..n_buckets {
-        let bs = start + (b as f64 * step) as usize;
-        let be = (start + ((b + 1) as f64 * step) as usize).min(end);
-        if bs >= be {
-            continue;
-        }
-        let mut min_i = bs;
-        let mut max_i = bs;
-        for i in bs..be {
-            if buf.data[i][1] < buf.data[min_i][1] {
-                min_i = i;
+
+    // dx is the width of exactly 1 bucket (e.g. 1 pixel) in X-axis (time) units.
+    let dx = (view_max_x - view_min_x) / (n_buckets as f64).max(1.0);
+    // Multiply by inverse dx inside the loop instead of dividing (massive performance boost)
+    let inv_dx = if dx > 0.0 && !dx.is_nan() { 1.0 / dx } else { 0.0 };
+
+    let get_bucket = |x: f64| -> i64 {
+        if inv_dx == 0.0 { 0 } else { ((x - view_min_x) * inv_dx).floor() as i64 }
+    };
+
+    let mut bs = start;
+    let mut current_bucket = get_bucket(buf.data[start][0]);
+    let mut min_i = start;
+    let mut max_i = start;
+
+    for i in start..end {
+        let bucket = get_bucket(buf.data[i][0]);
+
+        // If we crossed a bucket boundary in the time domain, flush the previous bucket
+        if bucket != current_bucket {
+            let be = i;
+            if bs < be {
+                let mut pts = [
+                    (bs, buf.data[bs]),
+                    (min_i, buf.data[min_i]),
+                    (max_i, buf.data[max_i]),
+                    (be - 1, buf.data[be - 1])
+                ];
+                pts.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+                let mut last_idx = usize::MAX;
+                for (idx, p) in pts {
+                    if idx != last_idx { out.push(p); last_idx = idx; }
+                }
             }
-            if buf.data[i][1] > buf.data[max_i][1] {
-                max_i = i;
-            }
+
+            // Start the new bucket
+            current_bucket = bucket;
+            bs = i;
+            min_i = i;
+            max_i = i;
+        } else {
+            // Fast in-flight tracking of local min/max within the current bucket
+            if buf.data[i][1] < buf.data[min_i][1] { min_i = i; }
+            if buf.data[i][1] > buf.data[max_i][1] { max_i = i; }
         }
+    }
+
+    // Process the final bucket slice at loop exit
+    if bs < end {
+        let be = end;
         let mut pts = [
             (bs, buf.data[bs]),
             (min_i, buf.data[min_i]),
             (max_i, buf.data[max_i]),
-            (be - 1, buf.data[be - 1]),
+            (be - 1, buf.data[be - 1])
         ];
-        pts.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        let mut last_i = usize::MAX;
+        pts.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        let mut last_idx = usize::MAX;
         for (idx, p) in pts {
-            if idx != last_i {
-                out.push(p);
-                last_i = idx;
-            }
+            if idx != last_idx { out.push(p); last_idx = idx; }
         }
     }
+
     out
 }
 
 #[derive(PartialEq, Clone, Copy)]
-enum XAnchor {
-    Left,
-    Center,
-    Right,
-}
+enum XAnchor { Left, Center, Right }
 #[derive(PartialEq, Clone, Copy)]
-enum YAnchor {
-    Top,
-    Center,
-    Bottom,
-}
+enum YAnchor { Top, Center, Bottom }
 
 struct LivePlotApp {
     raw_data: Arc<Mutex<Vec<SeriesBuffer>>>,
@@ -166,21 +180,11 @@ struct LivePlotApp {
 }
 
 impl LivePlotApp {
-    fn new(
-        args: Args,
-        raw_data: Arc<Mutex<Vec<SeriesBuffer>>>,
-        smoothed_data: Arc<Mutex<Vec<SeriesBuffer>>>,
-        tau_shared: Arc<Mutex<f64>>,
-        stream_ended: Arc<AtomicBool>,
-        new_data: Arc<AtomicBool>,
-        labels: Vec<String>,
-    ) -> Self {
+    fn new(args: Args, raw_data: Arc<Mutex<Vec<SeriesBuffer>>>, smoothed_data: Arc<Mutex<Vec<SeriesBuffer>>>, tau_shared: Arc<Mutex<f64>>, stream_ended: Arc<AtomicBool>, new_data: Arc<AtomicBool>, labels: Vec<String>) -> Self {
         let legend_corner = match args.legend_pos.to_lowercase().as_str() {
             "none" => None,
-            "lefttop" => Some(Corner::LeftTop),
-            "righttop" => Some(Corner::RightTop),
-            "leftbottom" => Some(Corner::LeftBottom),
-            "rightbottom" => Some(Corner::RightBottom),
+            "lefttop" => Some(Corner::LeftTop), "righttop" => Some(Corner::RightTop),
+            "leftbottom" => Some(Corner::LeftBottom), "rightbottom" => Some(Corner::RightBottom),
             _ => {
                 eprintln!("FATAL ERROR: Invalid --legend-pos '{}'.", args.legend_pos);
                 std::process::exit(1);
@@ -188,71 +192,30 @@ impl LivePlotApp {
         };
 
         Self {
-            raw_data,
-            smoothed_data,
-            stream_ended,
-            tau_shared,
-            include_y_values: args.include_y,
-            labels: labels.clone(),
-            colors: Self::generate_palette(args.colors),
-            visible: vec![true; labels.len()],
-            title: args.title,
-            legend_corner,
-            is_ts_mode: args.timestamp,
-            side_panel_collapsed: false,
-            tau: 0.000001,
-            max_tau: args.max_tau,
-            default_width: args.viewport_width,
-            x_zoom: 1.0,
-            scroll_offset: 0.0,
-            y_zoom: 1.0,
-            y_min: -1.0,
-            y_max: 1.0,
-            y_nat_h: 1.0,
-            auto_follow: true,
-            anchor_x: XAnchor::Right,
-            anchor_y: YAnchor::Bottom,
-            last_view_rect: None,
-            view_settling: false,
-            new_data,
-            cached_lines: Vec::new(),
+            raw_data, smoothed_data, stream_ended, tau_shared, include_y_values: args.include_y,
+            labels: labels.clone(), colors: Self::generate_palette(args.colors),
+            visible: vec![true; labels.len()], title: args.title, legend_corner, is_ts_mode: args.timestamp,
+            side_panel_collapsed: false, tau: 0.000001, max_tau: args.max_tau,
+            default_width: args.viewport_width, x_zoom: 1.0, scroll_offset: 0.0,
+            y_zoom: 1.0, y_min: -1.0, y_max: 1.0, y_nat_h: 1.0, auto_follow: true,
+            anchor_x: XAnchor::Right, anchor_y: YAnchor::Bottom,
+            last_view_rect: None, view_settling: false, new_data, cached_lines: Vec::new(),
         }
     }
 
     fn generate_palette(user_colors: Option<Vec<String>>) -> Vec<Color32> {
         let palette = [
-            Color32::from_rgb(255, 85, 85),
-            Color32::from_rgb(85, 255, 85),
-            Color32::from_rgb(85, 85, 255),
-            Color32::from_rgb(255, 255, 85),
-            Color32::from_rgb(255, 85, 255),
-            Color32::from_rgb(85, 255, 255),
-            Color32::from_rgb(255, 170, 0),
-            Color32::from_rgb(170, 0, 255),
-            Color32::from_rgb(0, 255, 170),
-            Color32::from_rgb(255, 0, 127),
-            Color32::from_rgb(170, 255, 0),
-            Color32::from_rgb(0, 170, 255),
-            Color32::from_rgb(255, 215, 180),
-            Color32::from_rgb(128, 128, 128),
-            Color32::from_rgb(170, 110, 40),
-            Color32::from_rgb(0, 128, 128),
-            Color32::from_rgb(230, 190, 255),
-            Color32::from_rgb(128, 0, 0),
-            Color32::from_rgb(170, 255, 195),
-            Color32::from_rgb(128, 128, 0),
+            Color32::from_rgb(255, 85, 85), Color32::from_rgb(85, 255, 85), Color32::from_rgb(85, 85, 255),
+            Color32::from_rgb(255, 255, 85), Color32::from_rgb(255, 85, 255), Color32::from_rgb(85, 255, 255),
+            Color32::from_rgb(255, 170, 0), Color32::from_rgb(170, 0, 255), Color32::from_rgb(0, 255, 170),
+            Color32::from_rgb(255, 0, 127), Color32::from_rgb(170, 255, 0), Color32::from_rgb(0, 170, 255),
+            Color32::from_rgb(255, 215, 180), Color32::from_rgb(128, 128, 128), Color32::from_rgb(170, 110, 40),
+            Color32::from_rgb(0, 128, 128), Color32::from_rgb(230, 190, 255), Color32::from_rgb(128, 0, 0),
+            Color32::from_rgb(170, 255, 195), Color32::from_rgb(128, 128, 0),
         ];
         let mut colors = Vec::new();
-        if let Some(h) = user_colors {
-            for hex in h {
-                if let Ok(c) = Color32::from_hex(&hex) {
-                    colors.push(c);
-                }
-            }
-        }
-        while colors.len() < 256 {
-            colors.push(palette[colors.len() % palette.len()]);
-        }
+        if let Some(h) = user_colors { for hex in h { if let Ok(c) = Color32::from_hex(&hex) { colors.push(c); } } }
+        while colors.len() < 256 { colors.push(palette[colors.len() % palette.len()]); }
         colors
     }
 
@@ -268,15 +231,12 @@ impl LivePlotApp {
                 for point in raw_series.data.iter().skip(1) {
                     let (cur_t, cur_x) = (point[0], point[1]);
                     // Safety check for small tau
-                    let y = if self.tau <= 1e-6 {
-                        cur_x
-                    } else {
+                    let y = if self.tau <= 1e-6 { cur_x } else {
                         let alpha = 1.0 - (-(cur_t - prev_t).max(0.0) / self.tau).exp();
                         alpha * cur_x + (1.0 - alpha) * prev_y
                     };
                     smooth_series.push([cur_t, y]);
-                    prev_y = y;
-                    prev_t = cur_t;
+                    prev_y = y; prev_t = cur_t;
                 }
             }
         }
@@ -294,134 +254,70 @@ fn format_x_val(x: f64, is_ts: bool) -> String {
 
 impl eframe::App for LivePlotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let panel_width = if self.side_panel_collapsed {
-            28.0
-        } else {
+        let panel_width = if self.side_panel_collapsed { 28.0 } else {
             let font_id = TextStyle::Button.resolve(&ctx.style());
             let max_label_w = ctx.fonts(|f| {
-                self.labels
-                    .iter()
-                    .map(|l| {
-                        f.layout_no_wrap(l.clone(), font_id.clone(), Color32::WHITE)
-                            .rect
-                            .width()
-                    })
-                    .fold(0.0, f32::max)
+                self.labels.iter().map(|l| f.layout_no_wrap(l.clone(), font_id.clone(), Color32::WHITE).rect.width()).fold(0.0, f32::max)
             });
             (max_label_w + 90.0).max(220.0).min(600.0)
         };
 
-        egui::SidePanel::right("settings_panel")
-            .resizable(false)
-            .exact_width(panel_width)
-            .show(ctx, |ui| {
-                if self.side_panel_collapsed {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(10.0);
-                        if ui.button("⏴").clicked() {
-                            self.side_panel_collapsed = false;
-                        }
-                    });
-                } else {
-                    ui.horizontal(|ui| {
-                        if ui.button("⏵").clicked() {
-                            self.side_panel_collapsed = true;
-                        }
-                        ui.heading("Settings");
-                    });
-                    ui.separator();
-                    ui.label(egui::RichText::new("Exponential Smoothing").strong());
-                    let mut tau_changed = false;
-                    ui.horizontal_wrapped(|ui| {
-                        for &(label, val) in &[
-                            ("None", 0.000001f64),
-                            ("1s", 1.0),
-                            ("5s", 5.0),
-                            ("15s", 15.0),
-                        ] {
-                            if ui
-                                .selectable_label((self.tau - val).abs() < 0.001, label)
-                                .clicked()
-                            {
-                                self.tau = val;
-                                tau_changed = true;
-                            }
-                        }
-                    });
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut self.tau, 0.000001..=self.max_tau)
-                                .show_value(true)
-                                .text("τ (s)"),
-                        )
-                        .changed()
-                    {
-                        tau_changed = true;
-                    }
-                    if tau_changed {
-                        *self.tau_shared.lock().unwrap() = self.tau;
-                        self.recompute_smoothing();
-                    }
+        egui::SidePanel::right("settings_panel").resizable(false).exact_width(panel_width).show(ctx, |ui| {
+            if self.side_panel_collapsed {
+                ui.vertical_centered(|ui| {
                     ui.add_space(10.0);
-                    ui.separator();
-                    ui.label(egui::RichText::new("Visibility").strong());
-                    ui.horizontal(|ui| {
-                        if ui.button("All").clicked() {
-                            self.visible.iter_mut().for_each(|v| *v = true);
-                        }
-                        if ui.button("None").clicked() {
-                            self.visible.iter_mut().for_each(|v| *v = false);
-                        }
-                    });
-                    ui.separator();
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        for i in 0..self.labels.len() {
-                            ui.horizontal(|ui| {
-                                let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(12.0, 12.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().rect_filled(rect, 2.0, self.colors[i]);
-                                if ui
-                                    .selectable_label(self.visible[i], &self.labels[i])
-                                    .clicked()
-                                {
-                                    self.visible[i] = !self.visible[i];
-                                }
-                            });
-                        }
-                    });
-                }
-            });
+                    if ui.button("⏴").clicked() { self.side_panel_collapsed = false; }
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    if ui.button("⏵").clicked() { self.side_panel_collapsed = true; }
+                    ui.heading("Settings");
+                });
+                ui.separator();
+                ui.label(egui::RichText::new("Exponential Smoothing").strong());
+                let mut tau_changed = false;
+                ui.horizontal_wrapped(|ui| {
+                    for &(label, val) in &[("None", 0.000001f64), ("1s", 1.0), ("5s", 5.0), ("15s", 15.0)] {
+                        if ui.selectable_label((self.tau - val).abs() < 0.001, label).clicked() { self.tau = val; tau_changed = true; }
+                    }
+                });
+                if ui.add(egui::Slider::new(&mut self.tau, 0.000001..=self.max_tau).show_value(true).text("τ (s)")).changed() { tau_changed = true; }
+                if tau_changed { *self.tau_shared.lock().unwrap() = self.tau; self.recompute_smoothing(); }
+                ui.add_space(10.0); ui.separator();
+                ui.label(egui::RichText::new("Visibility").strong());
+                ui.horizontal(|ui| {
+                    if ui.button("All").clicked() { self.visible.iter_mut().for_each(|v| *v = true); }
+                    if ui.button("None").clicked() { self.visible.iter_mut().for_each(|v| *v = false); }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for i in 0..self.labels.len() {
+                        ui.horizontal(|ui| {
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                            ui.painter().rect_filled(rect, 2.0, self.colors[i]);
+                            if ui.selectable_label(self.visible[i], &self.labels[i]).clicked() { self.visible[i] = !self.visible[i]; }
+                        });
+                    }
+                });
+            }
+        });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let mut first_x = 0.0;
-            let mut last_x = 0.0;
-            let mut g_min_y = f64::INFINITY;
-            let mut g_max_y = f64::NEG_INFINITY;
+            let mut first_x = 0.0; let mut last_x = 0.0;
+            let mut g_min_y = f64::INFINITY; let mut g_max_y = f64::NEG_INFINITY;
             {
                 let d = self.raw_data.lock().unwrap();
                 let mut found_x = false;
                 for buf in d.iter() {
                     if let (Some(f), Some(l)) = (buf.first(), buf.last()) {
-                        if !found_x || f[0] < first_x {
-                            first_x = f[0];
-                        }
-                        if !found_x || l[0] > last_x {
-                            last_x = l[0];
-                        }
+                        if !found_x || f[0] < first_x { first_x = f[0]; }
+                        if !found_x || l[0] > last_x { last_x = l[0]; }
                         found_x = true;
                     }
-                    for p in buf.data.iter() {
-                        g_min_y = g_min_y.min(p[1]);
-                        g_max_y = g_max_y.max(p[1]);
-                    }
+                    for p in buf.data.iter() { g_min_y = g_min_y.min(p[1]); g_max_y = g_max_y.max(p[1]); }
                 }
             }
-            if g_min_y.is_infinite() {
-                g_min_y = -1.0;
-                g_max_y = 1.0;
-            }
+            if g_min_y.is_infinite() { g_min_y = -1.0; g_max_y = 1.0; }
 
             let mut trigger = false;
             let layer_id = ui.layer_id();
@@ -431,53 +327,31 @@ impl eframe::App for LivePlotApp {
                 ui.heading(&self.title);
                 let font_id = TextStyle::Body.resolve(ui.style());
                 let max_status_w = ui.fonts(|f| {
-                    ["• LIVE", "EXPLORE", "⚠️ Ended"]
-                        .iter()
-                        .map(|s| {
-                            f.layout_no_wrap(s.to_string(), font_id.clone(), Color32::WHITE)
-                                .rect
-                                .width()
-                        })
+                    ["• LIVE", "EXPLORE", "⚠️ Ended"].iter()
+                        .map(|s| f.layout_no_wrap(s.to_string(), font_id.clone(), Color32::WHITE).rect.width())
                         .fold(0.0f32, f32::max)
                 });
                 ui.add_sized([max_status_w + 10.0, 20.0], |ui: &mut egui::Ui| {
                     ui.centered_and_justified(|ui| {
-                        if self.stream_ended.load(Ordering::Relaxed) {
-                            ui.colored_label(Color32::GOLD, "⚠️ Ended")
-                        } else if self.auto_follow {
-                            ui.colored_label(Color32::from_rgb(100, 200, 255), "• LIVE")
-                        } else {
-                            ui.weak("EXPLORE")
-                        }
-                    })
-                    .response
+                        if self.stream_ended.load(Ordering::Relaxed) { ui.colored_label(Color32::GOLD, "⚠️ Ended") }
+                        else if self.auto_follow { ui.colored_label(Color32::from_rgb(100, 200, 255), "• LIVE") }
+                        else { ui.weak("EXPLORE") }
+                    }).response
                 });
-                ui.separator();
-                ui.label("X-Anchor:");
+                ui.separator(); ui.label("X-Anchor:");
                 ui.selectable_value(&mut self.anchor_x, XAnchor::Left, "L");
                 ui.selectable_value(&mut self.anchor_x, XAnchor::Center, "C");
                 ui.selectable_value(&mut self.anchor_x, XAnchor::Right, "R");
-                ui.separator();
-                ui.label("X-Zoom:");
+                ui.separator(); ui.label("X-Zoom:");
                 let cur_x_w = self.default_width / self.x_zoom;
                 let cur_x_anchor = match self.anchor_x {
                     XAnchor::Left => self.scroll_offset,
                     XAnchor::Center => self.scroll_offset + (cur_x_w / 2.0),
                     XAnchor::Right => self.scroll_offset + cur_x_w,
                 };
-                let min_zx = (self.default_width / f64::max(last_x - first_x, self.default_width))
-                    .max(0.0001);
-                if ui
-                    .add_sized(
-                        [(ui.available_width() - 115.0).max(50.0), 20.0],
-                        egui::Slider::new(&mut self.x_zoom, min_zx..=2000.0)
-                            .show_value(false)
-                            .logarithmic(true),
-                    )
-                    .changed()
-                {
-                    self.auto_follow = false;
-                    trigger = true;
+                let min_zx = (self.default_width / f64::max(last_x - first_x, self.default_width)).max(0.0001);
+                if ui.add_sized([(ui.available_width() - 115.0).max(50.0), 20.0], egui::Slider::new(&mut self.x_zoom, min_zx..=2000.0).show_value(false).logarithmic(true)).changed() {
+                    self.auto_follow = false; trigger = true;
                     let new_x_w = self.default_width / self.x_zoom;
                     self.scroll_offset = match self.anchor_x {
                         XAnchor::Left => cur_x_anchor,
@@ -485,26 +359,16 @@ impl eframe::App for LivePlotApp {
                         XAnchor::Right => cur_x_anchor - new_x_w,
                     };
                 }
-                if ui.button("Reset Viewport").clicked() {
-                    self.x_zoom = 1.0;
-                    self.y_zoom = 1.0;
-                    self.auto_follow = true;
-                    trigger = true;
-                }
+                if ui.button("Reset Viewport").clicked() { self.x_zoom = 1.0; self.y_zoom = 1.0; self.auto_follow = true; trigger = true; }
             });
 
-            if self.auto_follow {
-                self.scroll_offset = (last_x - (self.default_width / self.x_zoom)).max(first_x);
-            }
+            if self.auto_follow { self.scroll_offset = (last_x - (self.default_width / self.x_zoom)).max(first_x); }
 
-            let body_layout =
-                egui::Layout::left_to_right(egui::Align::Min).with_cross_justify(true);
+            let body_layout = egui::Layout::left_to_right(egui::Align::Min).with_cross_justify(true);
             ui.with_layout(body_layout, |ui| {
                 let cur_y_h = (self.y_max - self.y_min).max(0.0001);
                 let cur_y_anchor = match self.anchor_y {
-                    YAnchor::Top => self.y_max,
-                    YAnchor::Center => self.y_min + (cur_y_h / 2.0),
-                    YAnchor::Bottom => self.y_min,
+                    YAnchor::Top => self.y_max, YAnchor::Center => self.y_min + (cur_y_h / 2.0), YAnchor::Bottom => self.y_min,
                 };
                 ui.vertical(|ui| {
                     ui.label("Y-Anchor");
@@ -513,202 +377,94 @@ impl eframe::App for LivePlotApp {
                     ui.selectable_value(&mut self.anchor_y, YAnchor::Bottom, "B");
                     ui.add_space(10.0);
                     let min_zy = (self.y_nat_h / f64::max(g_max_y - g_min_y, 0.1)).min(1.0);
-                    if ui
-                        .add_sized(
-                            [20.0, ui.available_height()],
-                            egui::Slider::new(&mut self.y_zoom, min_zy..=50.0)
-                                .vertical()
-                                .show_value(false)
-                                .logarithmic(true),
-                        )
-                        .changed()
-                    {
-                        self.auto_follow = false;
-                        trigger = true;
+                    if ui.add_sized([20.0, ui.available_height()], egui::Slider::new(&mut self.y_zoom, min_zy..=50.0).vertical().show_value(false).logarithmic(true)).changed() {
+                        self.auto_follow = false; trigger = true;
                         let new_y_h = self.y_nat_h / self.y_zoom;
                         match self.anchor_y {
-                            YAnchor::Top => {
-                                self.y_max = cur_y_anchor;
-                                self.y_min = self.y_max - new_y_h;
-                            }
-                            YAnchor::Center => {
-                                self.y_min = cur_y_anchor - (new_y_h / 2.0);
-                                self.y_max = cur_y_anchor + (new_y_h / 2.0);
-                            }
-                            YAnchor::Bottom => {
-                                self.y_min = cur_y_anchor;
-                                self.y_max = self.y_min + new_y_h;
-                            }
+                            YAnchor::Top => { self.y_max = cur_y_anchor; self.y_min = self.y_max - new_y_h; }
+                            YAnchor::Center => { self.y_min = cur_y_anchor - (new_y_h / 2.0); self.y_max = cur_y_anchor + (new_y_h / 2.0); }
+                            YAnchor::Bottom => { self.y_min = cur_y_anchor; self.y_max = self.y_min + new_y_h; }
                         }
                     }
                 });
 
-                let mut plot = Plot::new("lp")
-                    .height(ui.available_height() - 4.0)
-                    .width(ui.available_width())
-                    .auto_bounds([false, false].into())
-                    .allow_zoom(true)
-                    .allow_drag(true)
-                    .show_x(false)
-                    .show_y(false)
+                let mut plot = Plot::new("lp").height(ui.available_height() - 4.0).width(ui.available_width())
+                    .auto_bounds([false, false].into()).allow_zoom(true).allow_drag(true).show_x(false).show_y(false)
                     .label_formatter(|_, _| String::new());
 
                 if self.is_ts_mode {
                     plot = plot.x_grid_spacer(move |input: GridInput| {
                         let span = input.bounds.1 - input.bounds.0;
-                        let steps = [
-                            86400.0, 43200.0, 21600.0, 14400.0, 10800.0, 7200.0, 3600.0, 1800.0,
-                            900.0, 600.0, 300.0, 120.0, 60.0, 30.0, 15.0, 10.0, 5.0, 1.0,
-                        ];
-                        let major_step = steps
-                            .iter()
-                            .copied()
-                            .find(|&s| span / s >= 4.0)
-                            .unwrap_or(1.0);
+                        let steps = [86400.0, 43200.0, 21600.0, 14400.0, 10800.0, 7200.0, 3600.0, 1800.0, 900.0, 600.0, 300.0, 120.0, 60.0, 30.0, 15.0, 10.0, 5.0, 1.0];
+                        let major_step = steps.iter().copied().find(|&s| span / s >= 4.0).unwrap_or(1.0);
                         let minor_step = major_step / 4.0;
                         let sample_ts = input.bounds.0 as i64;
-                        let local_offset = if let Some(dt) = DateTime::from_timestamp(sample_ts, 0)
-                        {
-                            dt.with_timezone(&Local).offset().fix().local_minus_utc() as f64
-                        } else {
-                            0.0
-                        };
+                        let local_offset = if let Some(dt) = DateTime::from_timestamp(sample_ts, 0) { dt.with_timezone(&Local).offset().fix().local_minus_utc() as f64 } else { 0.0 };
                         let mut marks = Vec::new();
-                        let start_aligned = ((input.bounds.0 + local_offset) / minor_step).ceil()
-                            * minor_step
-                            - local_offset;
+                        let start_aligned = ((input.bounds.0 + local_offset) / minor_step).ceil() * minor_step - local_offset;
                         let mut val = start_aligned;
-                        while val <= input.bounds.1 {
-                            marks.push(GridMark {
-                                value: val,
-                                step_size: major_step,
-                            });
-                            val += minor_step;
-                        }
+                        while val <= input.bounds.1 { marks.push(GridMark { value: val, step_size: major_step }); val += minor_step; }
                         marks
                     });
                     plot = plot.x_axis_formatter(move |mark, range| {
-                        let local_offset =
-                            if let Some(dt) = DateTime::from_timestamp(mark.value as i64, 0) {
-                                dt.with_timezone(&Local).offset().fix().local_minus_utc() as f64
-                            } else {
-                                0.0
-                            };
+                        let local_offset = if let Some(dt) = DateTime::from_timestamp(mark.value as i64, 0) { dt.with_timezone(&Local).offset().fix().local_minus_utc() as f64 } else { 0.0 };
                         if ((mark.value + local_offset) % mark.step_size).abs() < 1e-5 {
                             if let Some(dt) = DateTime::from_timestamp(mark.value as i64, 0) {
                                 let ldt = dt.with_timezone(&Local);
                                 let span = *range.end() - *range.start();
-                                if span > 86400.0 {
-                                    ldt.format("%m/%d %H:%M").to_string()
-                                } else if mark.step_size >= 60.0 {
-                                    ldt.format("%H:%M").to_string()
-                                } else {
-                                    ldt.format("%H:%M:%S").to_string()
-                                }
-                            } else {
-                                "".into()
-                            }
-                        } else {
-                            "".into()
-                        }
+                                if span > 86400.0 { ldt.format("%m/%d %H:%M").to_string() }
+                                else if mark.step_size >= 60.0 { ldt.format("%H:%M").to_string() }
+                                else { ldt.format("%H:%M:%S").to_string() }
+                            } else { "".into() }
+                        } else { "".into() }
                     });
-                } else {
-                    plot = plot.x_axis_formatter(move |m, _| format!("{:.0}", m.value));
-                }
+                } else { plot = plot.x_axis_formatter(move |m, _| format!("{:.0}", m.value)); }
 
-                if let Some(pos) = self.legend_corner {
-                    plot = plot.legend(Legend::default().position(pos));
-                }
-                for &y in &self.include_y_values {
-                    plot = plot.include_y(y);
-                }
+                if let Some(pos) = self.legend_corner { plot = plot.legend(Legend::default().position(pos)); }
+                for &y in &self.include_y_values { plot = plot.include_y(y); }
 
                 let data_arc = self.smoothed_data.clone();
-                let labels = self.labels.clone();
-                let colors = self.colors.clone();
-                let is_ts = self.is_ts_mode;
-                let include_y = self.include_y_values.clone();
+                let labels = self.labels.clone(); let colors = self.colors.clone();
+                let is_ts = self.is_ts_mode; let include_y = self.include_y_values.clone();
                 let visible = self.visible.clone();
                 let def_w = self.default_width;
 
                 let plot_res = plot.show(ui, |plot_ui| {
-                    if plot_ui.pointer_coordinate_drag_delta().length() > 0.0
-                        || plot_ui.ctx().input(|i| i.raw_scroll_delta.y).abs() > 0.0
-                    {
+                    if plot_ui.pointer_coordinate_drag_delta().length() > 0.0 || plot_ui.ctx().input(|i| i.raw_scroll_delta.y).abs() > 0.0 {
                         self.auto_follow = false;
                     }
                     let b = plot_ui.plot_bounds();
 
                     // Correct v0.29 double click detection
-                    if plot_ui.ctx().input(|i| {
-                        i.pointer
-                            .button_double_clicked(egui::PointerButton::Primary)
-                    }) && plot_ui.response().hovered()
-                    {
-                        self.auto_follow = false;
-                        trigger = true;
-                        self.scroll_offset = first_x;
-                        self.x_zoom = def_w / f64::max(last_x - first_x, 0.001);
-                        self.y_min = g_min_y;
-                        self.y_max = g_max_y;
-                        self.y_nat_h = f64::max(g_max_y - g_min_y, 0.001);
-                        self.y_zoom = 1.0;
-                        plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                            [first_x, g_min_y],
-                            [last_x, g_max_y],
-                        ));
+                    if plot_ui.ctx().input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) && plot_ui.response().hovered() {
+                         self.auto_follow = false; trigger = true;
+                         self.scroll_offset = first_x;
+                         self.x_zoom = def_w / f64::max(last_x - first_x, 0.001);
+                         self.y_min = g_min_y; self.y_max = g_max_y; self.y_nat_h = f64::max(g_max_y - g_min_y, 0.001); self.y_zoom = 1.0;
+                         plot_ui.set_plot_bounds(PlotBounds::from_min_max([first_x, g_min_y], [last_x, g_max_y]));
                     }
 
                     if self.auto_follow {
                         let width = def_w / self.x_zoom;
                         let x_start = last_x - width;
-                        let mut min_y_vis = f64::INFINITY;
-                        let mut max_y_vis = f64::NEG_INFINITY;
+                        let mut min_y_vis = f64::INFINITY; let mut max_y_vis = f64::NEG_INFINITY;
                         let d = data_arc.lock().unwrap();
                         for (i, buf) in d.iter().enumerate() {
-                            if !visible[i] || buf.is_empty() {
-                                continue;
-                            }
+                            if !visible[i] || buf.is_empty() { continue; }
                             let si = buf.search_x(x_start).saturating_sub(1);
-                            for p in buf.data.iter().skip(si) {
-                                min_y_vis = min_y_vis.min(p[1]);
-                                max_y_vis = max_y_vis.max(p[1]);
-                            }
+                            for p in buf.data.iter().skip(si) { min_y_vis = min_y_vis.min(p[1]); max_y_vis = max_y_vis.max(p[1]); }
                         }
-                        for &y in &include_y {
-                            min_y_vis = min_y_vis.min(y);
-                            max_y_vis = max_y_vis.max(y);
-                        }
-                        let base = if min_y_vis.is_infinite() {
-                            (-1.0, 1.0)
-                        } else {
-                            let p = (max_y_vis - min_y_vis).max(0.1) * 0.05;
-                            (min_y_vis - p, max_y_vis + p)
-                        };
-                        self.y_min = base.0;
-                        self.y_max = base.1;
-                        self.y_nat_h = f64::max(base.1 - base.0, 0.001);
-                        self.y_zoom = 1.0;
+                        for &y in &include_y { min_y_vis = min_y_vis.min(y); max_y_vis = max_y_vis.max(y); }
+                        let base = if min_y_vis.is_infinite() { (-1.0, 1.0) } else { let p = (max_y_vis - min_y_vis).max(0.1) * 0.05; (min_y_vis - p, max_y_vis + p) };
+                        self.y_min = base.0; self.y_max = base.1; self.y_nat_h = f64::max(base.1 - base.0, 0.001); self.y_zoom = 1.0;
                         self.scroll_offset = x_start;
-                        plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                            [x_start, base.0],
-                            [last_x, base.1],
-                        ));
+                        plot_ui.set_plot_bounds(PlotBounds::from_min_max([x_start, base.0], [last_x, base.1]));
                     } else if trigger {
-                        plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                            [self.scroll_offset, self.y_min],
-                            [self.scroll_offset + (def_w / self.x_zoom), self.y_max],
-                        ));
+                        plot_ui.set_plot_bounds(PlotBounds::from_min_max([self.scroll_offset, self.y_min], [self.scroll_offset + (def_w / self.x_zoom), self.y_max]));
                     } else {
-                        self.scroll_offset = b.min()[0];
-                        self.y_min = b.min()[1];
-                        self.y_max = b.max()[1];
-                        if b.width() > 0.0 {
-                            self.x_zoom = def_w / b.width();
-                        }
-                        if b.height() > 0.0 {
-                            self.y_zoom = (self.y_nat_h / b.height()).max(0.001);
-                        }
+                        self.scroll_offset = b.min()[0]; self.y_min = b.min()[1]; self.y_max = b.max()[1];
+                        if b.width() > 0.0 { self.x_zoom = def_w / b.width(); }
+                        if b.height() > 0.0 { self.y_zoom = (self.y_nat_h / b.height()).max(0.001); }
                     }
 
                     // CACHED M4 BINNING
@@ -716,24 +472,14 @@ impl eframe::App for LivePlotApp {
                     let data_changed = self.new_data.swap(false, Ordering::Relaxed);
                     let cur_view = [b.min()[0], b.min()[1], b.max()[0], b.max()[1]];
 
-                    if data_changed
-                        || self.last_view_rect != Some(cur_view)
-                        || self.cached_lines.is_empty()
-                    {
+                    if data_changed || self.last_view_rect != Some(cur_view) || self.cached_lines.is_empty() {
                         let d = data_arc.lock().unwrap();
                         self.cached_lines.clear();
                         for (i, buf) in d.iter().enumerate() {
-                            if !visible[i] || buf.is_empty() {
-                                self.cached_lines.push(Vec::new());
-                                continue;
-                            }
+                            if !visible[i] || buf.is_empty() { self.cached_lines.push(Vec::new()); continue; }
                             let s_idx = buf.search_x(b.min()[0]).saturating_sub(1);
-                            let e_idx = if b.max()[0] >= buf.last().unwrap()[0] {
-                                buf.len()
-                            } else {
-                                buf.search_x(b.max()[0]).min(buf.len())
-                            };
-                            self.cached_lines.push(m4(buf, s_idx, e_idx, bins));
+                            let e_idx = if b.max()[0] >= buf.last().unwrap()[0] { buf.len() } else { buf.search_x(b.max()[0]).min(buf.len()) };
+                            self.cached_lines.push(m4(buf, s_idx, e_idx, bins, b.min()[0], b.max()[0]));
                         }
                         self.last_view_rect = Some(cur_view);
                         self.view_settling = true;
@@ -744,59 +490,35 @@ impl eframe::App for LivePlotApp {
                     }
 
                     for (i, pts) in self.cached_lines.iter().enumerate() {
-                        if !visible[i] || pts.is_empty() {
-                            continue;
-                        }
-                        plot_ui.line(
-                            Line::new(PlotPoints::new(pts.clone()))
-                                .name(&labels[i])
-                                .color(colors[i]),
-                        );
+                        if !visible[i] || pts.is_empty() { continue; }
+                        plot_ui.line(Line::new(PlotPoints::new(pts.clone())).name(&labels[i]).color(colors[i]));
                     }
 
                     if let Some(mp) = plot_ui.pointer_coordinate() {
                         let d = data_arc.lock().unwrap();
-                        let mut best = None;
-                        let mut bd = f64::INFINITY;
+                        let mut best = None; let mut bd = f64::INFINITY;
                         for si in 0..labels.len() {
-                            if !visible[si] {
-                                continue;
-                            }
+                            if !visible[si] { continue; }
                             if let Some(buf) = d.get(si) {
-                                if buf.is_empty() {
-                                    continue;
-                                }
+                                if buf.is_empty() { continue; }
                                 let idx = buf.search_x(mp.x);
                                 for j in idx.saturating_sub(1)..(idx + 2).min(buf.len()) {
-                                    let p = buf.data[j];
-                                    let dx = p[0] - mp.x;
-                                    let dy = (p[1] - mp.y) * (b.width() / b.height().max(0.1));
-                                    let dsq = dx * dx + dy * dy;
-                                    if dsq < bd {
-                                        bd = dsq;
-                                        best = Some((si, p[0], p[1]));
-                                    }
+                                    let p = buf.data[j]; let dx = p[0] - mp.x; let dy = (p[1] - mp.y) * (b.width() / b.height().max(0.1));
+                                    let dsq = dx * dx + dy * dy; if dsq < bd { bd = dsq; best = Some((si, p[0], p[1])); }
                                 }
                             }
                         }
                         if let Some((si, x, y)) = best {
                             if bd < (b.width() * 0.015).powi(2) {
                                 let xf = format_x_val(x, is_ts);
-                                egui::show_tooltip_at_pointer(
-                                    plot_ui.ctx(),
-                                    layer_id,
-                                    egui::Id::new("tt"),
-                                    |ui: &mut egui::Ui| {
-                                        ui.label(format!("{}: {:.4}\nX: {}", labels[si], y, xf));
-                                    },
-                                );
+                                egui::show_tooltip_at_pointer(plot_ui.ctx(), layer_id, egui::Id::new("tt"), |ui: &mut egui::Ui| {
+                                    ui.label(format!("{}: {:.4}\nX: {}", labels[si], y, xf));
+                                });
                             }
                         }
                     }
                 });
-                if trigger || plot_res.response.dragged() {
-                    ui.ctx().request_repaint();
-                }
+                if trigger || plot_res.response.dragged() { ui.ctx().request_repaint(); }
             });
         });
     }
@@ -806,147 +528,76 @@ fn main() {
     let args = Args::parse();
     let is_ts = args.timestamp;
     let period = args.sample_period;
-    let mut raw_labels = args
-        .labels
-        .clone()
-        .unwrap_or_else(|| vec!["Series 1".to_string()]);
+    let mut raw_labels = args.labels.clone().unwrap_or_else(|| vec!["Series 1".to_string()]);
     let label_count = raw_labels.len();
-    if args.sort_labels {
-        raw_labels.sort();
-    }
+    if args.sort_labels { raw_labels.sort(); }
     let display_labels = raw_labels;
 
     let input_to_display_map: Vec<usize> = {
         let mut map = vec![0; label_count];
-        let original_labels = args
-            .labels
-            .clone()
-            .unwrap_or_else(|| vec!["Series 1".to_string()]);
+        let original_labels = args.labels.clone().unwrap_or_else(|| vec!["Series 1".to_string()]);
         for (orig_idx, orig_label) in original_labels.iter().enumerate() {
-            if let Some(disp_idx) = display_labels.iter().position(|l| l == orig_label) {
-                map[orig_idx] = disp_idx;
-            }
+            if let Some(disp_idx) = display_labels.iter().position(|l| l == orig_label) { map[orig_idx] = disp_idx; }
         }
         map
     };
 
-    let raw_buffer: Arc<Mutex<Vec<SeriesBuffer>>> = Arc::new(Mutex::new(
-        (0..label_count)
-            .map(|_| SeriesBuffer::new(args.max_points))
-            .collect(),
-    ));
-    let smooth_buffer: Arc<Mutex<Vec<SeriesBuffer>>> = Arc::new(Mutex::new(
-        (0..label_count)
-            .map(|_| SeriesBuffer::new(args.max_points))
-            .collect(),
-    ));
+    let raw_buffer: Arc<Mutex<Vec<SeriesBuffer>>> = Arc::new(Mutex::new((0..label_count).map(|_| SeriesBuffer::new(args.max_points)).collect()));
+    let smooth_buffer: Arc<Mutex<Vec<SeriesBuffer>>> = Arc::new(Mutex::new((0..label_count).map(|_| SeriesBuffer::new(args.max_points)).collect()));
     let tau_shared = Arc::new(Mutex::new(0.000001));
     let stream_ended = Arc::new(AtomicBool::new(false));
     let new_data = Arc::new(AtomicBool::new(false));
+    
+    let (raw_thread, smooth_thread, tau_thread, stream_ended_thread, new_data_thread) = (Arc::clone(&raw_buffer), Arc::clone(&smooth_buffer), Arc::clone(&tau_shared), Arc::clone(&stream_ended), Arc::clone(&new_data));
 
-    let (raw_thread, smooth_thread, tau_thread, stream_ended_thread, new_data_thread) = (
-        Arc::clone(&raw_buffer),
-        Arc::clone(&smooth_buffer),
-        Arc::clone(&tau_shared),
-        Arc::clone(&stream_ended),
-        Arc::clone(&new_data),
-    );
-
-    eframe::run_native(
-        "Live Plotter",
-        eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default().with_inner_size([1500.0, 850.0]),
-            ..Default::default()
-        },
-        Box::new(move |cc| {
-            let ctx = cc.egui_ctx.clone();
-            let app_args = args.clone();
-            thread::spawn(move || {
-                let stdin = io::stdin();
-                let mut seq = 0u64;
-                for (li, line) in stdin.lock().lines().enumerate() {
-                    if let Ok(line_str) = line {
-                        let trimmed = line_str.trim();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-                        let tokens: Vec<&str> = trimmed
-                            .split(|c| c == ',' || c == ' ')
-                            .filter(|s| !s.is_empty())
-                            .collect();
-                        let expected = if is_ts { label_count + 1 } else { label_count };
-                        if tokens.len() != expected {
-                            eprintln!(
-                                "FATAL ERROR (line {}): expected {} cols, found {}.",
-                                li + 1,
-                                expected,
-                                tokens.len()
-                            );
-                            std::process::exit(1);
-                        }
-                        let (x, data_tokens) = if is_ts {
-                            (tokens[0].parse::<f64>().expect("Time fail"), &tokens[1..])
-                        } else {
-                            (seq as f64 * period, &tokens[..])
-                        };
-                        {
-                            let mut rb = raw_thread.lock().unwrap();
-                            let mut sb = smooth_thread.lock().unwrap();
-                            let t = *tau_thread.lock().unwrap();
-                            for i in 0..label_count {
-                                let disp_i = input_to_display_map[i];
-                                if data_tokens[i].to_lowercase() == "none"
-                                    || data_tokens[i].to_lowercase() == "null"
-                                {
-                                    continue;
+    eframe::run_native("Live Plotter", eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([1500.0, 850.0]), ..Default::default()
+    }, Box::new(move |cc| {
+        let ctx = cc.egui_ctx.clone();
+        let app_args = args.clone();
+        thread::spawn(move || {
+            let stdin = io::stdin();
+            let mut seq = 0u64;
+            for (li, line) in stdin.lock().lines().enumerate() {
+                if let Ok(line_str) = line {
+                    let trimmed = line_str.trim(); if trimmed.is_empty() { continue; }
+                    let tokens: Vec<&str> = trimmed.split(|c| c == ',' || c == ' ').filter(|s| !s.is_empty()).collect();
+                    let expected = if is_ts { label_count + 1 } else { label_count };
+                    if tokens.len() != expected { eprintln!("FATAL ERROR (line {}): expected {} cols, found {}.", li+1, expected, tokens.len()); std::process::exit(1); }
+                    let (x, data_tokens) = if is_ts { (tokens[0].parse::<f64>().expect("Time fail"), &tokens[1..]) } else { (seq as f64 * period, &tokens[..]) };
+                    {
+                        let mut rb = raw_thread.lock().unwrap();
+                        let mut sb = smooth_thread.lock().unwrap();
+                        let t = *tau_thread.lock().unwrap();
+                        for i in 0..label_count {
+                            let disp_i = input_to_display_map[i];
+                            if data_tokens[i].to_lowercase() == "none" || data_tokens[i].to_lowercase() == "null" { continue; }
+                            if let Ok(v) = data_tokens[i].parse::<f64>() {
+                                rb[disp_i].push([x, v]);
+                                if is_ts {
+                                    let mut j = rb[disp_i].len() - 1;
+                                    while j > 0 && rb[disp_i].data[j][0] < rb[disp_i].data[j - 1][0] { rb[disp_i].data.swap(j, j - 1); j -= 1; }
                                 }
-                                if let Ok(v) = data_tokens[i].parse::<f64>() {
-                                    rb[disp_i].push([x, v]);
-                                    if is_ts {
-                                        let mut j = rb[disp_i].len() - 1;
-                                        while j > 0
-                                            && rb[disp_i].data[j][0] < rb[disp_i].data[j - 1][0]
-                                        {
-                                            rb[disp_i].data.swap(j, j - 1);
-                                            j -= 1;
-                                        }
+                                let y = if let Some(last) = sb[disp_i].last() {
+                                    let dt = (x - last[0]).max(0.0);
+                                    // Division-by-zero safety
+                                    if t <= 1e-6 { v } else {
+                                        let alpha = 1.0 - (-(dt / t)).exp();
+                                        alpha * v + (1.0 - alpha) * last[1]
                                     }
-                                    let y = if let Some(last) = sb[disp_i].last() {
-                                        let dt = (x - last[0]).max(0.0);
-                                        // Division-by-zero safety
-                                        if t <= 1e-6 {
-                                            v
-                                        } else {
-                                            let alpha = 1.0 - (-(dt / t)).exp();
-                                            alpha * v + (1.0 - alpha) * last[1]
-                                        }
-                                    } else {
-                                        v
-                                    };
-                                    sb[disp_i].push([x, y]);
-                                }
+                                } else { v };
+                                sb[disp_i].push([x, y]);
                             }
-                            seq += 1;
                         }
-                        new_data_thread.store(true, Ordering::Relaxed);
-                        ctx.request_repaint();
-                    } else {
-                        break;
+                        seq += 1;
                     }
-                }
-                stream_ended_thread.store(true, Ordering::Relaxed);
-                ctx.request_repaint();
-            });
-            Ok(Box::new(LivePlotApp::new(
-                app_args,
-                raw_buffer,
-                smooth_buffer,
-                tau_shared,
-                stream_ended,
-                new_data,
-                display_labels,
-            )))
-        }),
-    )
-    .unwrap();
+                    new_data_thread.store(true, Ordering::Relaxed);
+                    ctx.request_repaint();
+                } else { break; }
+            }
+            stream_ended_thread.store(true, Ordering::Relaxed);
+            ctx.request_repaint();
+        });
+        Ok(Box::new(LivePlotApp::new(app_args, raw_buffer, smooth_buffer, tau_shared, stream_ended, new_data, display_labels)))
+    })).unwrap();
 }
