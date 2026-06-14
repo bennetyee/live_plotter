@@ -248,6 +248,13 @@ struct LivePlotApp {
     status_label_width: Option<f32>,
     /// Counts down from N after last interaction; >0 means use coarse M4.
     interacting_frames: u8,
+    /// Set by reader thread when new data arrives; cleared after first repaint.
+    new_data: Arc<AtomicBool>,
+    /// Cached M4 output reused on pointer-only frames.
+    cached_lines: Vec<Vec<[f64; 2]>>,
+    /// Viewport bounds when cached_lines was last computed.
+    cached_bounds: Option<[f64; 4]>,
+    cached_n_buckets: usize,
 }
 
 impl LivePlotApp {
@@ -258,6 +265,7 @@ impl LivePlotApp {
         tau_shared: Arc<Mutex<f64>>,
         stream_ended: Arc<AtomicBool>,
         labels: Vec<String>,
+        new_data: Arc<AtomicBool>,
     ) -> Self {
         let legend_corner = match args.legend_pos.to_lowercase().as_str() {
             "none" => None,
@@ -302,6 +310,10 @@ impl LivePlotApp {
             last_view_rect: None,
             status_label_width: None,
             interacting_frames: 0,
+            new_data,
+            cached_lines: Vec::new(),
+            cached_bounds: None,
+            cached_n_buckets: 0,
         }
     }
 
@@ -798,22 +810,16 @@ impl eframe::App for LivePlotApp {
                     }
 
                     // --- M4 min/max binning render ---
-                    // Detect active interaction (drag or scroll) and use a coarser bucket
-                    // count while the user is moving the viewport, switching back to
-                    // full-resolution a few frames after interaction stops.  This keeps
-                    // rendering cheap during the frames that matter for perceived
-                    // responsiveness while still showing full detail at rest.
+                    // Interaction detection: coarsen M4 while dragging/scrolling.
                     let is_interacting = plot_ui.pointer_coordinate_drag_delta().length() > 0.0
                         || plot_ui.ctx().input(|i| i.raw_scroll_delta.length()) > 0.0;
                     if is_interacting {
                         self.interacting_frames = 6; // ~100ms at 60fps
                     } else if self.interacting_frames > 0 {
                         self.interacting_frames -= 1;
-                        ctx.request_repaint(); // ensure we render the final full-res frame
+                        ctx.request_repaint();
                     }
                     let coarse = self.interacting_frames > 0;
-
-                    let d = data_arc.lock().unwrap();
                     let full_buckets = max_render.unwrap_or(plot_pixel_w).max(16);
                     let n_buckets = if coarse {
                         (full_buckets / 4).max(16)
@@ -821,23 +827,52 @@ impl eframe::App for LivePlotApp {
                         full_buckets
                     };
 
-                    for (i, buf) in d.iter().enumerate() {
-                        if !visible[i] || buf.is_empty() {
-                            continue;
-                        }
-                        let start_idx = buf.search_x(b.min()[0]).saturating_sub(1);
-                        let end_idx = buf.search_x(b.max()[0]).min(buf.len());
-                        let count = end_idx.saturating_sub(start_idx);
-                        if count == 0 {
-                            continue;
-                        }
+                    // Cache invalidation: recompute M4 only when the viewport changed,
+                    // new data arrived, or the bucket count changed.  On pointer-only
+                    // frames (mouse hover, no click, no new data) we reuse the cache.
+                    let cur_bounds = [b.min()[0], b.min()[1], b.max()[0], b.max()[1]];
+                    let got_new_data = self.new_data.swap(false, Ordering::Relaxed);
+                    let cache_valid = !got_new_data
+                        && self.cached_bounds == Some(cur_bounds)
+                        && self.cached_n_buckets == n_buckets
+                        && self.cached_lines.len() == labels.len();
 
-                        let pts = PlotPoints::new(m4(buf, start_idx, end_idx, n_buckets));
-                        plot_ui.line(Line::new(pts).name(&labels[i]).color(colors[i]));
+                    if !cache_valid {
+                        let d = data_arc.lock().unwrap();
+                        self.cached_lines.clear();
+                        for (i, buf) in d.iter().enumerate() {
+                            if !visible[i] || buf.is_empty() {
+                                self.cached_lines.push(Vec::new());
+                                continue;
+                            }
+                            let start_idx = buf.search_x(b.min()[0]).saturating_sub(1);
+                            let end_idx = buf.search_x(b.max()[0]).min(buf.len());
+                            let count = end_idx.saturating_sub(start_idx);
+                            if count == 0 {
+                                self.cached_lines.push(Vec::new());
+                                continue;
+                            }
+                            self.cached_lines
+                                .push(m4(buf, start_idx, end_idx, n_buckets));
+                        }
+                        self.cached_bounds = Some(cur_bounds);
+                        self.cached_n_buckets = n_buckets;
+                    }
+
+                    for (i, line_pts) in self.cached_lines.iter().enumerate() {
+                        if !visible[i] || line_pts.is_empty() {
+                            continue;
+                        }
+                        plot_ui.line(
+                            Line::new(PlotPoints::new(line_pts.clone()))
+                                .name(&labels[i])
+                                .color(colors[i]),
+                        );
                     }
 
                     // --- Tooltip: search each series independently ---
                     if let Some(mp) = plot_ui.pointer_coordinate() {
+                        let d = data_arc.lock().unwrap();
                         let bounds = plot_ui.plot_bounds();
                         // Normalize Y distances by aspect ratio so pixels are equal.
                         let y_scale = if bounds.height() > 0.0 {
@@ -931,6 +966,7 @@ fn spawn_reader(
     display_labels: Vec<String>,
     label_count: usize,
     ctx: egui::Context,
+    new_data: Arc<AtomicBool>,
     csv_out: Option<Arc<Mutex<Box<dyn io::Write + Send>>>>,
 ) {
     let is_ts = args.timestamp || args.json;
@@ -1033,6 +1069,7 @@ fn spawn_reader(
                     let _ = writeln!(out);
                 }
             }
+            new_data.store(true, Ordering::Relaxed);
             ctx.request_repaint();
         }
         stream_ended.store(true, Ordering::Relaxed);
@@ -1173,6 +1210,7 @@ fn main() {
 
     let tau_shared: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.000001));
     let stream_ended = Arc::new(AtomicBool::new(false));
+    let new_data_flag = Arc::new(AtomicBool::new(false));
 
     let csv_out: Option<Arc<Mutex<Box<dyn io::Write + Send>>>> = args.output.as_ref().map(|path| {
         let file = std::fs::OpenOptions::new()
@@ -1210,6 +1248,7 @@ fn main() {
                 display_labels.clone(),
                 label_count,
                 ctx,
+                Arc::clone(&new_data_flag),
                 csv_out,
             );
             Ok(Box::new(LivePlotApp::new(
@@ -1219,6 +1258,7 @@ fn main() {
                 tau_shared,
                 stream_ended,
                 display_labels,
+                new_data_flag,
             )))
         }),
     )
