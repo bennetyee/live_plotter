@@ -36,7 +36,90 @@ struct Args {
     max_tau: f64,
 }
 
-type SeriesBuffer = VecDeque<[f64; 2]>;
+struct SeriesBuffer {
+    data: VecDeque<[f64; 2]>,
+    capacity: usize,
+}
+
+impl SeriesBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            data: VecDeque::with_capacity(capacity.min(65536)),
+            capacity,
+        }
+    }
+    fn push(&mut self, point: [f64; 2]) {
+        if self.data.len() >= self.capacity {
+            self.data.pop_front();
+        }
+        self.data.push_back(point);
+    }
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+    fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+    fn search_x(&self, x: f64) -> usize {
+        let (mut lo, mut hi) = (0usize, self.data.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.data[mid][0] < x {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+    fn first(&self) -> Option<&[f64; 2]> {
+        self.data.front()
+    }
+    fn last(&self) -> Option<&[f64; 2]> {
+        self.data.back()
+    }
+}
+
+fn m4(buf: &SeriesBuffer, start: usize, end: usize, n_buckets: usize) -> Vec<[f64; 2]> {
+    let count = end - start;
+    if n_buckets == 0 || count <= n_buckets * 4 {
+        return buf.data.range(start..end).copied().collect();
+    }
+    let mut out = Vec::with_capacity(n_buckets * 4);
+    let step = count as f64 / n_buckets as f64;
+    for b in 0..n_buckets {
+        let bs = start + (b as f64 * step) as usize;
+        let be = (start + ((b + 1) as f64 * step) as usize).min(end);
+        if bs >= be {
+            continue;
+        }
+        let mut min_i = bs;
+        let mut max_i = bs;
+        for i in bs..be {
+            if buf.data[i][1] < buf.data[min_i][1] {
+                min_i = i;
+            }
+            if buf.data[i][1] > buf.data[max_i][1] {
+                max_i = i;
+            }
+        }
+        let mut pts = [
+            (bs, buf.data[bs]),
+            (min_i, buf.data[min_i]),
+            (max_i, buf.data[max_i]),
+            (be - 1, buf.data[be - 1]),
+        ];
+        pts.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let mut last_i = usize::MAX;
+        for (idx, p) in pts {
+            if idx != last_i {
+                out.push(p);
+                last_i = idx;
+            }
+        }
+    }
+    out
+}
 
 #[derive(PartialEq, Clone, Copy)]
 enum XAnchor {
@@ -63,12 +146,10 @@ struct LivePlotApp {
     title: String,
     legend_corner: Option<Corner>,
     is_ts_mode: bool,
-
     side_panel_collapsed: bool,
     tau: f64,
     max_tau: f64,
     default_width: f64,
-
     x_zoom: f64,
     scroll_offset: f64,
     y_zoom: f64,
@@ -78,8 +159,10 @@ struct LivePlotApp {
     auto_follow: bool,
     anchor_x: XAnchor,
     anchor_y: YAnchor,
-
     last_view_rect: Option<[f64; 4]>,
+    view_settling: bool,
+    new_data: Arc<AtomicBool>,
+    cached_lines: Vec<Vec<[f64; 2]>>,
 }
 
 impl LivePlotApp {
@@ -89,6 +172,7 @@ impl LivePlotApp {
         smoothed_data: Arc<Mutex<Vec<SeriesBuffer>>>,
         tau_shared: Arc<Mutex<f64>>,
         stream_ended: Arc<AtomicBool>,
+        new_data: Arc<AtomicBool>,
         labels: Vec<String>,
     ) -> Self {
         let legend_corner = match args.legend_pos.to_lowercase().as_str() {
@@ -129,6 +213,9 @@ impl LivePlotApp {
             anchor_x: XAnchor::Right,
             anchor_y: YAnchor::Bottom,
             last_view_rect: None,
+            view_settling: false,
+            new_data,
+            cached_lines: Vec::new(),
         }
     }
 
@@ -174,11 +261,11 @@ impl LivePlotApp {
         let mut smooth_lock = self.smoothed_data.lock().unwrap();
         for (i, raw_series) in raw_lock.iter().enumerate() {
             let smooth_series = &mut smooth_lock[i];
-            smooth_series.clear();
-            if let Some(first) = raw_series.front() {
-                smooth_series.push_back(*first);
+            smooth_series.data.clear();
+            if let Some(first) = raw_series.first() {
+                smooth_series.push(*first);
                 let (mut prev_y, mut prev_t) = (first[1], first[0]);
-                for point in raw_series.iter().skip(1) {
+                for point in raw_series.data.iter().skip(1) {
                     let (cur_t, cur_x) = (point[0], point[1]);
                     let alpha = 1.0 - (-(cur_t - prev_t).max(0.0) / self.tau).exp();
                     let y = if self.tau <= 1e-6 {
@@ -186,7 +273,7 @@ impl LivePlotApp {
                     } else {
                         alpha * cur_x + (1.0 - alpha) * prev_y
                     };
-                    smooth_series.push_back([cur_t, y]);
+                    smooth_series.push([cur_t, y]);
                     prev_y = y;
                     prev_t = cur_t;
                 }
@@ -206,7 +293,6 @@ fn format_x_val(x: f64, is_ts: bool) -> String {
 
 impl eframe::App for LivePlotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // --- SIDE PANEL ---
         let panel_width = if self.side_panel_collapsed {
             28.0
         } else {
@@ -316,7 +402,7 @@ impl eframe::App for LivePlotApp {
                 let d = self.raw_data.lock().unwrap();
                 let mut found_x = false;
                 for buf in d.iter() {
-                    if let (Some(f), Some(l)) = (buf.front(), buf.back()) {
+                    if let (Some(f), Some(l)) = (buf.first(), buf.last()) {
                         if !found_x || f[0] < first_x {
                             first_x = f[0];
                         }
@@ -325,7 +411,7 @@ impl eframe::App for LivePlotApp {
                         }
                         found_x = true;
                     }
-                    for p in buf.iter() {
+                    for p in buf.data.iter() {
                         g_min_y = g_min_y.min(p[1]);
                         g_max_y = g_max_y.max(p[1]);
                     }
@@ -365,6 +451,7 @@ impl eframe::App for LivePlotApp {
                     })
                     .response
                 });
+
                 ui.separator();
                 ui.label("X-Anchor:");
                 ui.selectable_value(&mut self.anchor_x, XAnchor::Left, "L");
@@ -378,8 +465,8 @@ impl eframe::App for LivePlotApp {
                     XAnchor::Center => self.scroll_offset + (cur_x_w / 2.0),
                     XAnchor::Right => self.scroll_offset + cur_x_w,
                 };
-                let min_zx =
-                    (self.default_width / (last_x - first_x).max(self.default_width)).max(0.0001);
+                let min_zx = (self.default_width / f64::max(last_x - first_x, self.default_width))
+                    .max(0.0001);
                 if ui
                     .add_sized(
                         [(ui.available_width() - 115.0).max(50.0), 20.0],
@@ -425,7 +512,7 @@ impl eframe::App for LivePlotApp {
                     ui.selectable_value(&mut self.anchor_y, YAnchor::Center, "C");
                     ui.selectable_value(&mut self.anchor_y, YAnchor::Bottom, "B");
                     ui.add_space(10.0);
-                    let min_zy = (self.y_nat_h / (g_max_y - g_min_y).max(0.1)).min(1.0);
+                    let min_zy = (self.y_nat_h / f64::max(g_max_y - g_min_y, 0.1)).min(1.0);
                     if ui
                         .add_sized(
                             [20.0, ui.available_height()],
@@ -479,12 +566,13 @@ impl eframe::App for LivePlotApp {
                             .find(|&s| span / s >= 4.0)
                             .unwrap_or(1.0);
                         let minor_step = major_step / 4.0;
-                        let local_offset =
-                            if let Some(dt) = DateTime::from_timestamp(input.bounds.0 as i64, 0) {
-                                dt.with_timezone(&Local).offset().fix().local_minus_utc() as f64
-                            } else {
-                                0.0
-                            };
+                        let sample_ts = input.bounds.0 as i64;
+                        let local_offset = if let Some(dt) = DateTime::from_timestamp(sample_ts, 0)
+                        {
+                            dt.with_timezone(&Local).offset().fix().local_minus_utc() as f64
+                        } else {
+                            0.0
+                        };
                         let mut marks = Vec::new();
                         let start_aligned = ((input.bounds.0 + local_offset) / minor_step).ceil()
                             * minor_step
@@ -544,12 +632,29 @@ impl eframe::App for LivePlotApp {
                 let def_w = self.default_width;
 
                 let plot_res = plot.show(ui, |plot_ui| {
-                    let drag_delta = plot_ui.pointer_coordinate_drag_delta();
-                    let scroll_delta = plot_ui.ctx().input(|i| i.raw_scroll_delta.y);
-                    if drag_delta.length() > 0.0 || scroll_delta.abs() > 0.0 {
+                    if plot_ui.pointer_coordinate_drag_delta().length() > 0.0
+                        || plot_ui.ctx().input(|i| i.raw_scroll_delta.y).abs() > 0.0
+                    {
                         self.auto_follow = false;
                     }
                     let b = plot_ui.plot_bounds();
+
+                    // --- RESET VIEWPORT ON DOUBLE CLICK ---
+                    if plot_ui.response().double_clicked() {
+                        self.auto_follow = false;
+                        trigger = true;
+                        self.scroll_offset = first_x;
+                        self.x_zoom = def_w / f64::max(last_x - first_x, 0.001);
+                        self.y_min = g_min_y;
+                        self.y_max = g_max_y;
+                        self.y_nat_h = f64::max(g_max_y - g_min_y, 0.001);
+                        self.y_zoom = 1.0;
+                        plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                            [first_x, g_min_y],
+                            [last_x, g_max_y],
+                        ));
+                        return;
+                    }
 
                     if self.auto_follow {
                         let width = def_w / self.x_zoom;
@@ -561,18 +666,8 @@ impl eframe::App for LivePlotApp {
                             if !visible[i] || buf.is_empty() {
                                 continue;
                             }
-                            // Binary search for visible range
-                            let mut l = 0;
-                            let mut h = buf.len();
-                            while l < h {
-                                let m = l + (h - l) / 2;
-                                if buf[m][0] < x_start {
-                                    l = m + 1;
-                                } else {
-                                    h = m;
-                                }
-                            }
-                            for p in buf.iter().skip(l.saturating_sub(1)) {
+                            let si = buf.search_x(x_start).saturating_sub(1);
+                            for p in buf.data.iter().skip(si) {
                                 min_y_vis = min_y_vis.min(p[1]);
                                 max_y_vis = max_y_vis.max(p[1]);
                             }
@@ -589,7 +684,7 @@ impl eframe::App for LivePlotApp {
                         };
                         self.y_min = base.0;
                         self.y_max = base.1;
-                        self.y_nat_h = (base.1 - base.0).max(0.001);
+                        self.y_nat_h = f64::max(base.1 - base.0, 0.001);
                         self.y_zoom = 1.0;
                         self.scroll_offset = x_start;
                         plot_ui.set_plot_bounds(PlotBounds::from_min_max(
@@ -613,109 +708,52 @@ impl eframe::App for LivePlotApp {
                         }
                     }
 
-                    // --- STABLE M4 BINNING ---
+                    // --- CACHED M4 LOGIC ---
                     let bins = plot_px_w as usize;
-                    let d = data_arc.lock().unwrap();
-                    for (i, buf) in d.iter().enumerate() {
-                        if !visible[i] || buf.is_empty() {
+                    let data_changed = self.new_data.swap(false, Ordering::Relaxed);
+                    let cur_view = [b.min()[0], b.min()[1], b.max()[0], b.max()[1]];
+
+                    if data_changed
+                        || self.last_view_rect != Some(cur_view)
+                        || self.cached_lines.is_empty()
+                    {
+                        let d = data_arc.lock().unwrap();
+                        self.cached_lines.clear();
+                        for (i, buf) in d.iter().enumerate() {
+                            if !visible[i] || buf.is_empty() {
+                                self.cached_lines.push(Vec::new());
+                                continue;
+                            }
+                            let s_idx = buf.search_x(b.min()[0]).saturating_sub(1);
+                            // Stable Tail: ensure end_idx covers the last data point if it's in view
+                            let e_idx = if b.max()[0] >= buf.last().unwrap()[0] {
+                                buf.len()
+                            } else {
+                                buf.search_x(b.max()[0]).min(buf.len())
+                            };
+                            self.cached_lines.push(m4(buf, s_idx, e_idx, bins));
+                        }
+                        self.last_view_rect = Some(cur_view);
+                        self.view_settling = true;
+                        ctx.request_repaint();
+                    } else if self.view_settling {
+                        self.view_settling = false;
+                        ctx.request_repaint();
+                    }
+
+                    for (i, pts) in self.cached_lines.iter().enumerate() {
+                        if !visible[i] || pts.is_empty() {
                             continue;
                         }
-
-                        let (mut l, mut h) = (0, buf.len());
-                        while l < h {
-                            let m = l + (h - l) / 2;
-                            if buf[m][0] < b.min()[0] {
-                                l = m + 1;
-                            } else {
-                                h = m;
-                            }
-                        }
-                        let s_idx = l.saturating_sub(1);
-                        let (mut l, mut h) = (0, buf.len());
-                        while l < h {
-                            let m = l + (h - l) / 2;
-                            if buf[m][0] < b.max()[0] {
-                                l = m + 1;
-                            } else {
-                                h = m;
-                            }
-                        }
-                        // Fix flicker: Force e_idx to include the very last point if the viewport includes the end
-                        let e_idx = if b.max()[0] >= buf.back().unwrap()[0] {
-                            buf.len()
-                        } else {
-                            l.min(buf.len())
-                        };
-
-                        let count = e_idx - s_idx;
-                        if count == 0 {
-                            continue;
-                        }
-
-                        if count > bins * 4 {
-                            let step = count / bins;
-                            plot_ui.line(
-                                Line::new(PlotPoints::from_parametric_callback(
-                                    move |t| {
-                                        let bin_idx = (t.round() as usize) / 4;
-                                        let sub_idx = (t.round() as usize) % 4;
-                                        let bs = s_idx + (bin_idx * step);
-                                        let be = (bs + step).min(e_idx);
-                                        if bs >= buf.len() {
-                                            return (buf[buf.len() - 1][0], buf[buf.len() - 1][1]);
-                                        }
-                                        match sub_idx {
-                                            0 => (buf[bs][0], buf[bs][1]),
-                                            3 => (buf[be - 1][0], buf[be - 1][1]),
-                                            _ => {
-                                                let mut l_min = f64::INFINITY;
-                                                let mut l_max = f64::NEG_INFINITY;
-                                                let (mut mi, mut mai) = (bs, bs);
-                                                for j in bs..be {
-                                                    let y = buf[j][1];
-                                                    if y < l_min {
-                                                        l_min = y;
-                                                        mi = j;
-                                                    }
-                                                    if y > l_max {
-                                                        l_max = y;
-                                                        mai = j;
-                                                    }
-                                                }
-                                                let (early, late) =
-                                                    if mi < mai { (mi, mai) } else { (mai, mi) };
-                                                let p = if sub_idx == 1 {
-                                                    buf[early]
-                                                } else {
-                                                    buf[late]
-                                                };
-                                                (p[0], p[1])
-                                            }
-                                        }
-                                    },
-                                    0.0..=((bins * 4) as f64),
-                                    (bins * 4) + 1,
-                                ))
+                        plot_ui.line(
+                            Line::new(PlotPoints::new(pts.clone()))
                                 .name(&labels[i])
                                 .color(colors[i]),
-                            );
-                        } else {
-                            plot_ui.line(
-                                Line::new(PlotPoints::from_parametric_callback(
-                                    move |t| {
-                                        let idx = (s_idx + t.round() as usize).min(e_idx - 1);
-                                        (buf[idx][0], buf[idx][1])
-                                    },
-                                    0.0..=(count as f64 - 1.0),
-                                    count,
-                                ))
-                                .name(&labels[i])
-                                .color(colors[i]),
-                            );
-                        }
+                        );
                     }
 
                     if let Some(mp) = plot_ui.pointer_coordinate() {
+                        let d = data_arc.lock().unwrap();
                         let mut best = None;
                         let mut bd = f64::INFINITY;
                         for si in 0..labels.len() {
@@ -726,17 +764,9 @@ impl eframe::App for LivePlotApp {
                                 if buf.is_empty() {
                                     continue;
                                 }
-                                let (mut l, mut h) = (0, buf.len());
-                                while l < h {
-                                    let m = l + (h - l) / 2;
-                                    if buf[m][0] < mp.x {
-                                        l = m + 1;
-                                    } else {
-                                        h = m;
-                                    }
-                                }
-                                for j in l.saturating_sub(1)..(l + 2).min(buf.len()) {
-                                    let p = buf[j];
+                                let idx = buf.search_x(mp.x);
+                                for j in idx.saturating_sub(1)..(idx + 2).min(buf.len()) {
+                                    let p = buf.data[j];
                                     let dx = p[0] - mp.x;
                                     let dy = (p[1] - mp.y) * (b.width() / b.height().max(0.1));
                                     let dsq = dx * dx + dy * dy;
@@ -761,14 +791,8 @@ impl eframe::App for LivePlotApp {
                             }
                         }
                     }
-
-                    let cur_v = [b.min()[0], b.min()[1], b.max()[0], b.max()[1]];
-                    if self.last_view_rect != Some(cur_v) {
-                        self.last_view_rect = Some(cur_v);
-                        ctx.request_repaint();
-                    }
                 });
-                if trigger || plot_res.response.dragged() || plot_res.response.double_clicked() {
+                if trigger || plot_res.response.dragged() {
                     ui.ctx().request_repaint();
                 }
             });
@@ -804,24 +828,25 @@ fn main() {
         map
     };
 
-    let expected = if is_ts { label_count + 1 } else { label_count };
     let raw_buffer: Arc<Mutex<Vec<SeriesBuffer>>> = Arc::new(Mutex::new(
         (0..label_count)
-            .map(|_| VecDeque::with_capacity(args.max_points))
+            .map(|_| SeriesBuffer::new(args.max_points))
             .collect(),
     ));
     let smooth_buffer: Arc<Mutex<Vec<SeriesBuffer>>> = Arc::new(Mutex::new(
         (0..label_count)
-            .map(|_| VecDeque::with_capacity(args.max_points))
+            .map(|_| SeriesBuffer::new(args.max_points))
             .collect(),
     ));
+    let tau_shared = Arc::new(Mutex::new(0.000001));
+    let stream_ended = Arc::new(AtomicBool::new(false));
+    let new_data = Arc::new(AtomicBool::new(false));
 
     let raw_thread = Arc::clone(&raw_buffer);
     let smooth_thread = Arc::clone(&smooth_buffer);
-    let tau_shared = Arc::new(Mutex::new(0.000001));
     let tau_thread = Arc::clone(&tau_shared);
-    let stream_ended = Arc::new(AtomicBool::new(false));
     let stream_ended_thread = Arc::clone(&stream_ended);
+    let new_data_thread = Arc::clone(&new_data);
     let max_pts = args.max_points;
 
     eframe::run_native(
@@ -835,7 +860,7 @@ fn main() {
             thread::spawn(move || {
                 let stdin = io::stdin();
                 let mut seq = 0;
-                for (_, line) in stdin.lock().lines().enumerate() {
+                for (li, line) in stdin.lock().lines().enumerate() {
                     if let Ok(line_str) = line {
                         let trimmed = line_str.trim();
                         if trimmed.is_empty() {
@@ -845,19 +870,18 @@ fn main() {
                             .split(|c| c == ',' || c == ' ')
                             .filter(|s| !s.is_empty())
                             .collect();
+                        let expected = if is_ts { label_count + 1 } else { label_count };
                         if tokens.len() != expected {
                             eprintln!(
-                                "FATAL ERROR: expected {} cols, found {}.",
+                                "FATAL ERROR (line {}): expected {} cols, found {}.",
+                                li + 1,
                                 expected,
                                 tokens.len()
                             );
                             std::process::exit(1);
                         }
                         let (x, data_tokens) = if is_ts {
-                            (
-                                tokens[0].parse::<f64>().expect("Time must be float"),
-                                &tokens[1..],
-                            )
+                            (tokens[0].parse::<f64>().expect("Time fail"), &tokens[1..])
                         } else {
                             (seq as f64 * period, &tokens[..])
                         };
@@ -866,22 +890,24 @@ fn main() {
                             let mut sb = smooth_thread.lock().unwrap();
                             let t = *tau_thread.lock().unwrap();
                             for i in 0..label_count {
+                                let disp_i = input_to_display_map[i];
+                                if data_tokens[i].to_lowercase() == "none"
+                                    || data_tokens[i].to_lowercase() == "null"
+                                {
+                                    continue;
+                                }
                                 if let Ok(v) = data_tokens[i].parse::<f64>() {
-                                    if rb[i].len() >= max_pts {
-                                        rb[i].pop_front();
-                                    }
-                                    rb[i].push_back([x, v]);
+                                    rb[disp_i].push([x, v]);
                                     if is_ts {
-                                        let mut j = rb[i].len() - 1;
-                                        while j > 0 && rb[i][j][0] < rb[i][j - 1][0] {
-                                            rb[i].swap(j, j - 1);
+                                        let mut j = rb[disp_i].len() - 1;
+                                        while j > 0
+                                            && rb[disp_i].data[j][0] < rb[disp_i].data[j - 1][0]
+                                        {
+                                            rb[disp_i].data.swap(j, j - 1);
                                             j -= 1;
                                         }
                                     }
-                                    if sb[i].len() >= max_pts {
-                                        sb[i].pop_front();
-                                    }
-                                    let y = if let Some(last) = sb[i].back() {
+                                    let y = if let Some(last) = sb[disp_i].last() {
                                         let dt = (x - last[0]).max(0.0);
                                         let alpha = 1.0 - (-(dt / t)).exp();
                                         if t <= 1e-6 {
@@ -892,11 +918,12 @@ fn main() {
                                     } else {
                                         v
                                     };
-                                    sb[i].push_back([x, y]);
+                                    sb[disp_i].push([x, y]);
                                 }
                             }
                             seq += 1;
                         }
+                        new_data_thread.store(true, Ordering::Relaxed);
                         ctx.request_repaint();
                     } else {
                         break;
@@ -906,11 +933,12 @@ fn main() {
                 ctx.request_repaint();
             });
             Ok(Box::new(LivePlotApp::new(
-                args.clone(),
+                args,
                 raw_buffer,
                 smooth_buffer,
                 tau_shared,
                 stream_ended,
+                new_data,
                 display_labels,
             )))
         }),
