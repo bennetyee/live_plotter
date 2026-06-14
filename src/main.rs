@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "High-Performance Event-Driven Plotter")]
+#[command(author, version, about = "High-Performance Live Plotter")]
 struct Args {
     #[arg(short, long, default_value_t = 1000000)]
     max_points: usize,
@@ -267,10 +267,11 @@ impl LivePlotApp {
                 let (mut prev_y, mut prev_t) = (first[1], first[0]);
                 for point in raw_series.data.iter().skip(1) {
                     let (cur_t, cur_x) = (point[0], point[1]);
-                    let alpha = 1.0 - (-(cur_t - prev_t).max(0.0) / self.tau).exp();
+                    // Safety check for small tau
                     let y = if self.tau <= 1e-6 {
                         cur_x
                     } else {
+                        let alpha = 1.0 - (-(cur_t - prev_t).max(0.0) / self.tau).exp();
                         alpha * cur_x + (1.0 - alpha) * prev_y
                     };
                     smooth_series.push([cur_t, y]);
@@ -451,7 +452,6 @@ impl eframe::App for LivePlotApp {
                     })
                     .response
                 });
-
                 ui.separator();
                 ui.label("X-Anchor:");
                 ui.selectable_value(&mut self.anchor_x, XAnchor::Left, "L");
@@ -639,8 +639,12 @@ impl eframe::App for LivePlotApp {
                     }
                     let b = plot_ui.plot_bounds();
 
-                    // --- RESET VIEWPORT ON DOUBLE CLICK ---
-                    if plot_ui.response().double_clicked() {
+                    // Correct v0.29 double click detection
+                    if plot_ui.ctx().input(|i| {
+                        i.pointer
+                            .button_double_clicked(egui::PointerButton::Primary)
+                    }) && plot_ui.response().hovered()
+                    {
                         self.auto_follow = false;
                         trigger = true;
                         self.scroll_offset = first_x;
@@ -653,7 +657,6 @@ impl eframe::App for LivePlotApp {
                             [first_x, g_min_y],
                             [last_x, g_max_y],
                         ));
-                        return;
                     }
 
                     if self.auto_follow {
@@ -708,7 +711,7 @@ impl eframe::App for LivePlotApp {
                         }
                     }
 
-                    // --- CACHED M4 LOGIC ---
+                    // CACHED M4 BINNING
                     let bins = plot_px_w as usize;
                     let data_changed = self.new_data.swap(false, Ordering::Relaxed);
                     let cur_view = [b.min()[0], b.min()[1], b.max()[0], b.max()[1]];
@@ -725,7 +728,6 @@ impl eframe::App for LivePlotApp {
                                 continue;
                             }
                             let s_idx = buf.search_x(b.min()[0]).saturating_sub(1);
-                            // Stable Tail: ensure end_idx covers the last data point if it's in view
                             let e_idx = if b.max()[0] >= buf.last().unwrap()[0] {
                                 buf.len()
                             } else {
@@ -842,12 +844,13 @@ fn main() {
     let stream_ended = Arc::new(AtomicBool::new(false));
     let new_data = Arc::new(AtomicBool::new(false));
 
-    let raw_thread = Arc::clone(&raw_buffer);
-    let smooth_thread = Arc::clone(&smooth_buffer);
-    let tau_thread = Arc::clone(&tau_shared);
-    let stream_ended_thread = Arc::clone(&stream_ended);
-    let new_data_thread = Arc::clone(&new_data);
-    let max_pts = args.max_points;
+    let (raw_thread, smooth_thread, tau_thread, stream_ended_thread, new_data_thread) = (
+        Arc::clone(&raw_buffer),
+        Arc::clone(&smooth_buffer),
+        Arc::clone(&tau_shared),
+        Arc::clone(&stream_ended),
+        Arc::clone(&new_data),
+    );
 
     eframe::run_native(
         "Live Plotter",
@@ -857,9 +860,10 @@ fn main() {
         },
         Box::new(move |cc| {
             let ctx = cc.egui_ctx.clone();
+            let app_args = args.clone();
             thread::spawn(move || {
                 let stdin = io::stdin();
-                let mut seq = 0;
+                let mut seq = 0u64;
                 for (li, line) in stdin.lock().lines().enumerate() {
                     if let Ok(line_str) = line {
                         let trimmed = line_str.trim();
@@ -909,10 +913,11 @@ fn main() {
                                     }
                                     let y = if let Some(last) = sb[disp_i].last() {
                                         let dt = (x - last[0]).max(0.0);
-                                        let alpha = 1.0 - (-(dt / t)).exp();
+                                        // Division-by-zero safety
                                         if t <= 1e-6 {
                                             v
                                         } else {
+                                            let alpha = 1.0 - (-(dt / t)).exp();
                                             alpha * v + (1.0 - alpha) * last[1]
                                         }
                                     } else {
@@ -933,7 +938,7 @@ fn main() {
                 ctx.request_repaint();
             });
             Ok(Box::new(LivePlotApp::new(
-                args,
+                app_args,
                 raw_buffer,
                 smooth_buffer,
                 tau_shared,
