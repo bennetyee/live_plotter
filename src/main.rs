@@ -2,7 +2,7 @@ use chrono::{DateTime, Local, Offset};
 use clap::Parser;
 use eframe::egui;
 use egui::{Color32, TextStyle};
-use egui_plot::{Corner, GridInput, GridMark, Legend, Line, Plot, PlotBounds, PlotPoints};
+use egui_plot::{GridInput, GridMark, HLine, Line, Plot, PlotBounds, PlotPoints, Points, VLine};
 use std::collections::VecDeque;
 use std::io::{self, BufRead};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +14,7 @@ use std::thread;
 struct Args {
     #[arg(short, long, default_value_t = 1000000)]
     max_points: usize,
+    /// Initial viewport width in X-axis units: seconds when using --timestamp, or seq*sample-period otherwise. Default 500s ≈ 8 min.
     #[arg(short, long, default_value_t = 500.0)]
     viewport_width: f64,
     #[arg(short, long, default_value_t = false)]
@@ -30,8 +31,6 @@ struct Args {
     colors: Option<Vec<String>>,
     #[arg(long, default_value = "Live Time-Series Feed")]
     title: String,
-    #[arg(long, default_value = "LeftTop")]
-    legend_pos: String,
     #[arg(long, default_value_t = 60.0)]
     max_tau: f64,
 }
@@ -198,7 +197,6 @@ struct LivePlotApp {
     colors: Vec<Color32>,
     visible: Vec<bool>,
     title: String,
-    legend_corner: Option<Corner>,
     is_ts_mode: bool,
     side_panel_collapsed: bool,
     tau: f64,
@@ -221,6 +219,12 @@ struct LivePlotApp {
     status_label_width: Option<f32>,
     /// Counts down after interaction ends; >0 means use coarse M4 buckets.
     interacting_frames: u8,
+    /// Per-series highlight state (color swatch click in legend).
+    highlighted: Vec<bool>,
+    /// One-shot identify mode: next plot click finds nearest point.
+    identifying: bool,
+    /// Result of last identify action: (series_idx, x, y).
+    identified: Option<(usize, f64, f64)>,
 }
 
 impl LivePlotApp {
@@ -233,17 +237,6 @@ impl LivePlotApp {
         new_data: Arc<AtomicBool>,
         labels: Vec<String>,
     ) -> Self {
-        let legend_corner = match args.legend_pos.to_lowercase().as_str() {
-            "none" => None,
-            "lefttop" => Some(Corner::LeftTop),
-            "righttop" => Some(Corner::RightTop),
-            "leftbottom" => Some(Corner::LeftBottom),
-            "rightbottom" => Some(Corner::RightBottom),
-            _ => {
-                eprintln!("FATAL ERROR: Invalid --legend-pos '{}'.", args.legend_pos);
-                std::process::exit(1);
-            }
-        };
         Self {
             raw_data,
             smoothed_data,
@@ -254,7 +247,6 @@ impl LivePlotApp {
             colors: Self::generate_palette(args.colors),
             visible: vec![true; labels.len()],
             title: args.title,
-            legend_corner,
             is_ts_mode: args.timestamp,
             side_panel_collapsed: false,
             tau: 0.000001,
@@ -275,6 +267,9 @@ impl LivePlotApp {
             cached_lines: Vec::new(),
             status_label_width: None,
             interacting_frames: 0,
+            highlighted: vec![false; labels.len()],
+            identifying: false,
+            identified: None,
         }
     }
 
@@ -424,30 +419,73 @@ impl eframe::App for LivePlotApp {
                     }
                     ui.add_space(10.0);
                     ui.separator();
-                    ui.label(egui::RichText::new("Visibility").strong());
+                    ui.label(egui::RichText::new("Series").strong());
                     ui.horizontal(|ui| {
-                        if ui.button("All").clicked() {
+                        if ui.button("Show All").clicked() {
                             self.visible.iter_mut().for_each(|v| *v = true);
+                            self.cached_lines.clear();
                         }
-                        if ui.button("None").clicked() {
+                        if ui.button("Hide All").clicked() {
                             self.visible.iter_mut().for_each(|v| *v = false);
+                            self.cached_lines.clear();
+                        }
+                        if ui.button("Unhighlight").clicked() {
+                            self.highlighted.iter_mut().for_each(|h| *h = false);
+                            self.identified = None;
                         }
                     });
+                    ui.label(
+                        egui::RichText::new("● = highlight  label = show/hide")
+                            .weak()
+                            .small(),
+                    );
                     ui.separator();
+                    // Track whether the user clicked anywhere in the scroll area but
+                    // NOT on a swatch or label, so we can clear highlights on blank clicks.
                     egui::ScrollArea::vertical().show(ui, |ui| {
+                        let any_highlighted = self.highlighted.iter().any(|&h| h);
                         for i in 0..self.labels.len() {
                             ui.horizontal(|ui| {
-                                let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(12.0, 12.0),
-                                    egui::Sense::hover(),
+                                // Color swatch = toggle highlight
+                                let swatch_color = if self.highlighted[i] {
+                                    self.colors[i] // full brightness when highlighted
+                                } else if any_highlighted {
+                                    // Dim unselected swatches when something else is highlighted
+                                    let c = self.colors[i];
+                                    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 80)
+                                } else {
+                                    self.colors[i]
+                                };
+                                let (swatch_rect, swatch_resp) = ui.allocate_exact_size(
+                                    egui::vec2(14.0, 14.0),
+                                    egui::Sense::click(),
                                 );
-                                ui.painter().rect_filled(rect, 2.0, self.colors[i]);
-                                if ui
-                                    .selectable_label(self.visible[i], &self.labels[i])
-                                    .clicked()
-                                {
+                                // Draw swatch with highlight ring if active
+                                ui.painter().rect_filled(swatch_rect, 2.0, swatch_color);
+                                if self.highlighted[i] {
+                                    ui.painter().rect_stroke(
+                                        swatch_rect.expand(2.0),
+                                        2.0,
+                                        egui::Stroke::new(2.0, Color32::WHITE),
+                                    );
+                                }
+                                if swatch_resp.clicked() {
+                                    self.highlighted[i] = !self.highlighted[i];
+                                    // Clearing the last highlight also clears identify result
+                                    if !self.highlighted.iter().any(|&h| h) {
+                                        self.identified = None;
+                                    }
+                                }
+
+                                // Label = toggle visibility
+                                let label_text = if self.visible[i] {
+                                    egui::RichText::new(&self.labels[i])
+                                } else {
+                                    egui::RichText::new(&self.labels[i]).weak()
+                                };
+                                if ui.selectable_label(self.visible[i], label_text).clicked() {
                                     self.visible[i] = !self.visible[i];
-                                    self.cached_lines.clear(); // visibility change invalidates cache
+                                    self.cached_lines.clear();
                                 }
                             });
                         }
@@ -486,7 +524,6 @@ impl eframe::App for LivePlotApp {
             }
 
             let mut trigger = false;
-            let layer_id = ui.layer_id();
             let plot_px_w = ui.available_width() as usize;
 
             // --- HEADER ---
@@ -559,6 +596,23 @@ impl eframe::App for LivePlotApp {
                     self.y_zoom = 1.0;
                     self.auto_follow = true;
                     trigger = true;
+                }
+                ui.separator();
+                let id_label = if self.identifying {
+                    "⊕ Cancel"
+                } else {
+                    "⊕ Identify"
+                };
+                if ui.button(id_label).clicked() {
+                    self.identifying = !self.identifying;
+                }
+                // Show identify result if any
+                if let Some((si, ix, iy)) = self.identified {
+                    let xf = format_x_val(ix, self.is_ts_mode);
+                    ui.colored_label(
+                        self.colors[si],
+                        format!("{}  {:.4}  @ {}", self.labels[si], iy, xf),
+                    );
                 }
             });
 
@@ -682,9 +736,6 @@ impl eframe::App for LivePlotApp {
                     plot = plot.x_axis_formatter(move |m, _| format!("{:.0}", m.value));
                 }
 
-                if let Some(pos) = self.legend_corner {
-                    plot = plot.legend(Legend::default().position(pos));
-                }
                 for &y in &self.include_y_values {
                     plot = plot.include_y(y);
                 }
@@ -692,7 +743,6 @@ impl eframe::App for LivePlotApp {
                 let data_arc = self.smoothed_data.clone();
                 let labels = self.labels.clone();
                 let colors = self.colors.clone();
-                let is_ts = self.is_ts_mode;
                 let include_y = self.include_y_values.clone();
                 let visible = self.visible.clone();
                 let def_w = self.default_width;
@@ -837,61 +887,84 @@ impl eframe::App for LivePlotApp {
                         ctx.request_repaint();
                     }
 
+                    // --- HIGHLIGHT-AWARE LINE RENDERING ---
+                    let any_highlighted = self.highlighted.iter().any(|&h| h);
                     for (i, pts) in self.cached_lines.iter().enumerate() {
                         if !visible[i] || pts.is_empty() {
                             continue;
                         }
+                        let base_color = colors[i];
+                        let (line_color, line_width) = if any_highlighted {
+                            if self.highlighted[i] {
+                                (base_color, 2.5f32) // highlighted: full color, thicker
+                            } else {
+                                // Dim non-highlighted curves to ~25% alpha
+                                let c = base_color;
+                                (
+                                    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 64),
+                                    1.0f32,
+                                )
+                            }
+                        } else {
+                            (base_color, 1.5f32)
+                        };
                         plot_ui.line(
                             Line::new(PlotPoints::new(pts.clone()))
                                 .name(&labels[i])
-                                .color(colors[i]),
+                                .color(line_color)
+                                .width(line_width),
                         );
                     }
 
-                    // --- TOOLTIP ---
-                    if let Some(mp) = plot_ui.pointer_coordinate() {
-                        let d = data_arc.lock().unwrap();
-                        let y_scale = b.width() / b.height().max(0.1);
-                        let snap_sq = (b.width() * 0.015).powi(2);
-                        let mut best: Option<(usize, f64, f64)> = None;
-                        let mut best_dsq = f64::INFINITY;
-                        for si in 0..labels.len() {
-                            if !visible[si] {
-                                continue;
-                            }
-                            if let Some(buf) = d.get(si) {
-                                if buf.is_empty() {
+                    // --- IDENTIFY: crosshair on identified point ---
+                    if let Some((si, ix, iy)) = self.identified {
+                        let pt_color = colors[si];
+                        plot_ui.vline(VLine::new(ix).color(pt_color).width(1.0));
+                        plot_ui.hline(HLine::new(iy).color(pt_color).width(1.0));
+                        // Bright dot at the exact point
+                        plot_ui.points(
+                            Points::new(PlotPoints::new(vec![[ix, iy]]))
+                                .color(Color32::WHITE)
+                                .radius(5.0),
+                        );
+                    }
+
+                    // --- ONE-SHOT IDENTIFY CLICK ---
+                    if self.identifying && plot_ui.response().clicked() {
+                        if let Some(click_pos) = plot_ui.pointer_coordinate() {
+                            let d = data_arc.lock().unwrap();
+                            let y_scale = b.width() / b.height().max(0.1);
+                            let mut best: Option<(usize, f64, f64)> = None;
+                            let mut best_dsq = f64::INFINITY;
+                            for si in 0..labels.len() {
+                                if !visible[si] {
                                     continue;
                                 }
-                                let idx = buf.search_x(mp.x);
-                                for j in idx.saturating_sub(1)..(idx + 2).min(buf.len()) {
-                                    let p = buf.data[j];
-                                    let dx = p[0] - mp.x;
-                                    let dy = (p[1] - mp.y) * y_scale;
-                                    let dsq = dx * dx + dy * dy;
-                                    if dsq < best_dsq {
-                                        best_dsq = dsq;
-                                        best = Some((si, p[0], p[1]));
+                                if let Some(buf) = d.get(si) {
+                                    if buf.is_empty() {
+                                        continue;
+                                    }
+                                    let idx = buf.search_x(click_pos.x);
+                                    for j in idx.saturating_sub(2)..(idx + 3).min(buf.len()) {
+                                        let p = buf.data[j];
+                                        let dx = p[0] - click_pos.x;
+                                        let dy = (p[1] - click_pos.y) * y_scale;
+                                        let dsq = dx * dx + dy * dy;
+                                        if dsq < best_dsq {
+                                            best_dsq = dsq;
+                                            best = Some((si, p[0], p[1]));
+                                        }
                                     }
                                 }
                             }
-                        }
-                        if best_dsq < snap_sq {
-                            if let Some((si, x, y)) = best {
-                                egui::show_tooltip_at_pointer(
-                                    plot_ui.ctx(),
-                                    layer_id,
-                                    egui::Id::new("tt"),
-                                    |ui: &mut egui::Ui| {
-                                        ui.label(format!(
-                                            "{}: {:.4}\nX: {}",
-                                            labels[si],
-                                            y,
-                                            format_x_val(x, is_ts)
-                                        ));
-                                    },
-                                );
+                            if let Some((si, px, py)) = best {
+                                self.identified = Some((si, px, py));
+                                // Auto-highlight the identified series so crosshair
+                                // color matches its curve color.
+                                self.highlighted[si] = true;
                             }
+                            self.identifying = false;
+                            ctx.request_repaint();
                         }
                     }
                 });
